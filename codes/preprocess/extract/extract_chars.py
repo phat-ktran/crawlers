@@ -22,6 +22,7 @@ def parse_html(file_path: Path) -> dict:
     # Extract strokes from first <div class="hvres-meaning">
     strokes = ""
     radicals = ""
+    stroke_idx = -1
     meaning_divs = soup.find_all("div", class_="hvres-meaning")
     if meaning_divs:
         first_meaning = meaning_divs[0]
@@ -29,15 +30,16 @@ def parse_html(file_path: Path) -> dict:
         content = [s.strip() for s in content]
         try:
             stroke_idx = content.index("Nét bút:")
-            if stroke_idx >= 0 and stroke_idx + 1 < len(content):
-                strokes = content[stroke_idx + 1]
+            strokes = content[stroke_idx + 1]
         except ValueError:
             pass
 
         try:
-            radical_idx = content.index("Hình thái:")
-            if radical_idx >= 0 and radical_idx + 1 < len(content):
-                radicals = content[radical_idx + 1]
+            radicals = []
+            for a_tag in first_meaning.find_all("a", href=True):
+                if a_tag["href"].startswith("/whv"):
+                    radicals.append(a_tag.text.strip())
+            radicals = "".join(radicals)
         except ValueError:
             pass
 
@@ -100,8 +102,8 @@ def main():
 
     # Save to Excel
     df = pd.DataFrame(results)
-    xlsx_path = xlsx_dir / "output.xlsx"
-    df.to_excel(xlsx_path, index=False, columns=["ID", "Strokes", "Radicals"])
+    df.to_excel(xlsx_dir / "output.xlsx", index=False, columns=["ID", "Strokes", "Radicals"])
+    df.to_csv(xlsx_dir / "output.csv", index=False, columns=["ID", "Strokes", "Radicals"])
 
     # Save JSON
     counter = 0
