@@ -35,7 +35,7 @@ def compute_similarity(idx, all_chars, all_lengths, threshold):
     
     # Sort by edit_distance ascending (most similar first)
     similar_pairs.sort(key=lambda x: x[0])
-    similar_chars = [pair[1] for pair in similar_pairs]
+    similar_chars = [pair[1] for pair in similar_pairs][:20]
     
     return char, similar_chars
 
@@ -59,10 +59,10 @@ def process_file(input_path, output_path, num_processes, threshold):
         results = list(tqdm(results_iter, total=len(all_chars), desc="Computing similarities"))
 
     with open(output_path, mode='w', encoding='utf-8', newline='') as csv_file:
-        writer = csv.writer(csv_file)
+        writer = csv.writer(csv_file, delimiter=":")
         writer.writerow(['Char', 'Candidates'])
         for char, candidates in results:
-            writer.writerow([char, json.dumps(candidates, ensure_ascii=False)])
+            writer.writerow([char, "".join(candidates)])
 
 
 if __name__ == "__main__":

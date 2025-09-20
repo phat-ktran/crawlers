@@ -57,7 +57,6 @@ def main():
 
     if args.local:
         function_url = 'http://127.0.0.1:54321/functions/v1/http-proxy'
-        anon_key = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZS1kZW1vIiwicm9sZSI6ImFub24iLCJleHAiOjE5ODM4MTI5OTZ9.CRXP1A7WOeoJeXxjNni43kdQwgnWNReilDMblYTn_I0'
     else:
         supabase_url = 'https://ifjvmbrpwypgnmxcfvsl.supabase.co/functions/v1/http-proxy'
         function_url = f"{supabase_url}/functions/v1/http-proxy"
