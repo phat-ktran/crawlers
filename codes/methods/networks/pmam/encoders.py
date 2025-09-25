@@ -12,45 +12,35 @@ class PhoneticEncoder(nn.Module):
         raise NotImplementedError("Subclasses must implement the hidden_size property.")
 
 
-class PhoBERTEncoder(PhoneticEncoder):
-    def __init__(self) -> None:
+class PhoBERTEncoder(nn.Module):
+    def __init__(self, model_name="vinai/phobert-base-v2"):
         super().__init__()
-        self.viet_encoder = AutoModel.from_pretrained("vinai/phovert-base-v2", torchscript=True)
+        self.viet_encoder = AutoModel.from_pretrained(model_name)
         self.viet_encoder.eval()
         for param in self.viet_encoder.parameters():
             param.requires_grad = False
-        self.tokenizer = AutoTokenizer.from_pretrained("vinai/phovert-base-v2")
+        self.tokenizer = AutoTokenizer.from_pretrained(model_name)
 
     @property
     def hidden_size(self):
         return self.viet_encoder.config.hidden_size
 
-    def forward(self, viet_texts, seq_len, device):
-        batch_size = len(viet_texts)
-
-        inputs = self.tokenizer(
-            viet_texts, padding=True, return_tensors="pt", return_offsets_mapping=True
-        )
-        out = self.viet_encoder(**inputs)
-
-        hidden = (
-            out.last_hidden_state
-        )  # shape: (batch_size, max_subword_len, viet_hidden_size
-
-        padded = torch.zeros(
-            batch_size, seq_len, self.viet_encoder.config.hidden_size, device=device
-        )
-
-        for i, length in enumerate(inputs["attention_mask"].sum(dim=1)):
-            padded[i, :length, :] = hidden[i, :length, :]
-
-        return padded
+    def forward(self, viet_texts, device):
+        with torch.no_grad():
+            inputs = self.tokenizer(
+                viet_texts, padding=True, truncation=True, return_tensors="pt"
+            ).to(device)
+            out = self.viet_encoder(**inputs)
+            hidden = out.last_hidden_state  # (batch, subword_len, hidden_size)
+        return hidden, inputs["attention_mask"]
 
 
 class BARTphoEncoder(PhoneticEncoder):
     def __init__(self) -> None:
         super().__init__()
-        self.viet_encoder = AutoModel.from_pretrained("vinai/bartpho-syllable", torchscript=True)
+        self.viet_encoder = AutoModel.from_pretrained(
+            "vinai/bartpho-syllable", torchscript=True
+        )
         self.viet_encoder.eval()
         for param in self.viet_encoder.parameters():
             param.requires_grad = False
@@ -62,21 +52,26 @@ class BARTphoEncoder(PhoneticEncoder):
 
     def forward(self, viet_texts, seq_len, device):
         batch_size = len(viet_texts)
+        with torch.no_grad():
+            inputs = self.tokenizer(
+                viet_texts,
+                padding=True,  # pad to longest sequence in batch
+                truncation=True,  # cut off if longer than max_length
+                return_tensors="pt",  # return PyTorch tensors
+            )
+            attn_mask = inputs["attention_mask"]
+            out = self.viet_encoder(**inputs)
+            hidden = (
+                out.last_hidden_state
+            )  # shape: (batch_size, max_subword_len, viet_hidden_size
 
-        inputs = self.tokenizer(
-            viet_texts, padding=True, return_tensors="pt", return_offsets_mapping=True
-        )
-        out = self.viet_encoder(**inputs)
+            padded_hidden = torch.zeros(
+                batch_size, seq_len, self.hidden_size, device=hidden.device
+            )
 
-        hidden = (
-            out.last_hidden_state
-        )  # shape: (batch_size, max_subword_len, viet_hidden_size
+            # Copy each sequence up to its real length
+            lengths = attn_mask.sum(dim=1)  # number of valid tokens per sentence
+            for i, length in enumerate(lengths):
+                padded_hidden[i, :length, :] = hidden[i, :length, :]
 
-        padded = torch.zeros(
-            batch_size, seq_len, self.viet_encoder.config.hidden_size, device=device
-        )
-
-        for i, length in enumerate(inputs["attention_mask"].sum(dim=1)):
-            padded[i, :length, :] = hidden[i, :length, :]
-
-        return padded
+        return padded_hidden

@@ -1,7 +1,7 @@
 from torch import nn
 import torch
 
-from encoders import PhoneticEncoder
+from codes.methods.networks.pmam.encoders import PhoBERTEncoder
 
 
 class TransformBlock(nn.Module):
@@ -33,13 +33,49 @@ class Standard(TransformBlock):
         return raw_enc, tilde_h, None
 
 
-class PMAM(TransformBlock):
+class CrossAttention(nn.Module):
+    """
+    Align Sino-Nom token stream with PhoBERT subword features
+    via cross-attention.
+    """
+    def __init__(self, sino_hidden_size, viet_hidden_size, attn_heads=8):
+        super().__init__()
+        self.query_proj = nn.Linear(sino_hidden_size, viet_hidden_size)
+        self.attn = nn.MultiheadAttention(
+            embed_dim=viet_hidden_size, num_heads=attn_heads, batch_first=True
+        )
+        self.out_proj = nn.Linear(viet_hidden_size, sino_hidden_size)
+
+    def forward(self, sino_states, viet_hidden, viet_mask=None):
+        """
+        sino_states: (batch, seq_len, sino_hidden_size)
+        viet_hidden: (batch, subword_len, viet_hidden_size)
+        viet_mask:   (batch, subword_len)
+        """
+        Q = self.query_proj(sino_states)  # (batch, seq_len, viet_hidden_size)
+
+        # MultiheadAttention expects key_padding_mask with True = masked
+        if viet_mask is not None:
+            key_padding_mask = viet_mask == 0
+        else:
+            key_padding_mask = None
+
+        attn_out, attn_weights = self.attn(
+            query=Q, key=viet_hidden, value=viet_hidden,
+            key_padding_mask=key_padding_mask
+        )
+        aligned = self.out_proj(attn_out)  # (batch, seq_len, sino_hidden_size)
+        return aligned, attn_weights
+
+
+class PMAMWithBERT(TransformBlock):
     def __init__(
         self,
-        phonetic_enc: PhoneticEncoder,
+        phonetic_enc: PhoBERTEncoder,
         hidden_size: int,
         gate_hid: int,
         att_dim: int,
+        att_heads: int,
         **kwargs,
     ) -> None:
         super().__init__()
@@ -49,34 +85,25 @@ class PMAM(TransformBlock):
             nn.Tanh(),
             nn.Linear(gate_hid, 1),
         )
-        self.W_e = nn.Linear(2 * hidden_size, att_dim)
-        self.W_t = nn.Linear(self.phonetic_enc.hidden_size, att_dim)
-        self.U = nn.Linear(hidden_size, att_dim)
-        self.v = nn.Linear(att_dim, 1)
+        self.cross_aligner = CrossAttention(
+            sino_hidden_size=2*hidden_size,
+            viet_hidden_size=self.phonetic_enc.hidden_size,
+            attn_heads=att_heads,
+        )
         self.inner_dim = hidden_size
 
     @property
     def hidden_size(self) -> int:
-        return 2 * self.inner_dim + self.phonetic_enc.hidden_size
+        return 2 * self.inner_dim
 
     def forward(self, e, viet_texts, device):
-        h = self.phonetic_enc(
-            viet_texts, device
-        )  # h shape: (batch_size, seq_len, self.phonetic_enc.hidden_size)
-        eh = torch.cat(
-            (e, h), dim=2
-        )  # eh shape: (batch_size, seq_len, 2 * hidden_size + viet_hidden_size)
-        l = self.gate_mlp(eh).squeeze(2)  # l shape: (batch_size, seq_len)
-        tilde_b = torch.sigmoid(l)  # tilde_b shape: (batch_size, seq_len)
-
-        we_e = self.W_e(e)  # we_e shape: (batch_size, seq_len, att_dim)
-        x_g = (1 - tilde_b).unsqueeze(
-            2
-        ) * we_e  # x_g shape: (batch_size, seq_len, att_dim)
-        wt_h = self.W_t(h)  # wt_h shape: (batch_size, seq_len, att_dim)
-
-        tilde_h = x_g + wt_h  # tilde_h shape: (batch_size, seq_len, att_dim)
-        raw_enc = torch.cat(
-            (e, h), dim=2
-        )  # raw_enc shape: (batch_size, seq_len, self.transform.hidden_size)
-        return raw_enc, tilde_h, l
+        viet_hidden, viet_mask = self.phonetic_enc(viet_texts, device)
+        aligned, attn_weights = self.cross_aligner(e, viet_hidden, viet_mask)
+        
+        # Concatenate and gate
+        eh = torch.cat([e, aligned], dim=-1)  # (batch, seq_len, 2*sino_hidden_size)
+        l = self.gate_mlp(eh).squeeze(-1)     # (batch, seq_len)
+        tilde_b = torch.sigmoid(l)
+        gated_enc = (1 - tilde_b).unsqueeze(-1) * e + tilde_b.unsqueeze(-1) * aligned
+        
+        return e, gated_enc, l

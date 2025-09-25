@@ -4,18 +4,14 @@ import logging
 import torch
 from torch.utils.data import DataLoader
 
-import sys
-
-
-sys.path.append(os.path.dirname(os.path.abspath(__file__)))
-from networks.pmam.attn import Standard, PMAM
-from networks.seq2seq import (
+from codes.methods.networks.pmam.attn import Standard, PMAMWithBERT
+from codes.methods.networks.seq2seq import (
     Seq2Seq,
     SinoNomDataset,
     collate_fn,
 )
-from networks.pmam.losses import DecodingLoss, MCGLoss
-from utils import (
+from codes.methods.networks.pmam.losses import DecodingLoss, MCGLoss
+from codes.methods.utils import (
     greedy_decoding,
     pad_y_shift_to_string,
     compute_avg_cer,
@@ -83,10 +79,8 @@ def run_dry_run(
                 # Test CER computation
                 print("\nTesting CER computation...")
                 pad_y_shift_cpu = pad_y_shift.to("cpu")
-                cer = compute_avg_cer(
-                    greedy_decoding(logits, id_to_token),
-                    pad_y_shift_to_string(pad_y_shift_cpu, id_to_token),
-                )
+                predictions, gt = greedy_decoding(logits, mask, id_to_token), pad_y_shift_to_string(pad_y_shift_cpu, mask, id_to_token),
+                cer = compute_avg_cer(predictions, gt)
                 print(f"CER: {cer:.4f}")
 
                 print("\n=== DRY RUN SUCCESSFUL ===")
@@ -109,16 +103,18 @@ if __name__ == "__main__":
     parser.add_argument("--checkpoint", default=None)
     parser.add_argument("--embeddings", type=str, default=None)
     parser.add_argument("--epochs", type=int, default=10)
+    parser.add_argument("--bypass_check", action="store_true", help="Bypass 1-1 mapping check")
     parser.add_argument("--print_batch_step", type=int, default=10)
     parser.add_argument("--lr", type=float, default=0.001)
     parser.add_argument("--batch_size", type=int, default=32)
     parser.add_argument("--num_workers", type=int, default=4)
+    parser.add_argument("--save_res_path", type=str, default=None)
     parser.add_argument("--scale", type=float, default=0.5)
     parser.add_argument(
-        "--transform", type=str, choices=["Standard", "PMAM"], default="Standard"
+        "--transform", type=str, choices=["Standard", "PMAMWithBERT"], default="Standard"
     )
     parser.add_argument(
-        "--phonetic", type=str, choices=["phoBERT", "BARTpho"], default="phoBERT"
+        "--phonetic", type=str, choices=["PhoBERTEncoder", "BARTphoEncoder"], default="PhoBERTEncoder"
     )
     parser.add_argument(
         "--dry_run",
@@ -137,7 +133,7 @@ if __name__ == "__main__":
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     with open(os.path.join(args.input_dir, "vocab.txt")) as f:
-        chars = [line.strip() for line in f]
+        chars = [line.strip() for line in f if line.strip()]
     vocab = {"<pad>": PAD_ID, "<unk>": UNK_ID, "<sos>": SOS_ID, "<eos>": EOS_ID}
     for c in chars:
         if c not in vocab:
@@ -150,8 +146,8 @@ if __name__ == "__main__":
     with open(os.path.join(args.input_dir, "val.txt")) as f:
         val_lines = f.readlines()
 
-    train_ds = SinoNomDataset(train_lines, vocab)
-    val_ds = SinoNomDataset(val_lines, vocab)
+    train_ds = SinoNomDataset(train_lines, vocab, args.bypass_check)
+    val_ds = SinoNomDataset(val_lines, vocab, args.bypass_check)
 
     train_dl = DataLoader(
         train_ds,
@@ -169,14 +165,15 @@ if __name__ == "__main__":
     )
 
     embed_dim = 256
-    hidden_size = 256
-    att_dim = 128
-    gate_hid = 128
+    hidden_size = 384
+    att_dim = 2 * hidden_size
+    gate_hid = 256
+    att_heads = 8
 
     transform_blk = args.transform
     phonetic_blk = args.phonetic
     if transform_blk != "Standard":
-        from networks.pmam.encoders import PhoBERTEncoder, BARTphoEncoder
+        from codes.methods.networks.pmam.encoders import PhoBERTEncoder, BARTphoEncoder
 
     model = Seq2Seq(
         vocab_size=vocab_size,
@@ -187,6 +184,7 @@ if __name__ == "__main__":
             hidden_size=hidden_size,
             gate_hid=gate_hid,
             att_dim=att_dim,
+            att_heads=att_heads,
             phonetic_enc=None if transform_blk == "Standard" else eval(phonetic_blk)(),
         ),
     )
@@ -212,9 +210,16 @@ if __name__ == "__main__":
             model, train_dl, val_dl, device, id_to_token, decoding_loss_fn, mcg_loss_fn
         )
         exit(0)
+        
+    logging.info(
+        f"Loaded {len(train_ds)} training samples and {len(val_ds)} validation samples."
+    )
+    logging.info(f"Using device: {device}")
 
     print_batch_step = args.print_batch_step
     total_steps_per_epoch = len(train_dl)
+    logging.info(f"Total steps per epoch: {total_steps_per_epoch}")
+
     for epoch in range(start_epoch, args.epochs):
         model.train()
         current_steps = 0
@@ -235,12 +240,10 @@ if __name__ == "__main__":
             optimizer.step()
 
             pad_y_shift = pad_y_shift.to("cpu")
-            cer = compute_avg_cer(
-                greedy_decoding(logits, id_to_token),
-                pad_y_shift_to_string(pad_y_shift, id_to_token),
-            )
 
             if current_steps % print_batch_step == 0:
+                predictions, gt = greedy_decoding(logits, mask, id_to_token), pad_y_shift_to_string(pad_y_shift, mask, id_to_token),
+                cer = compute_avg_cer(predictions, gt)
                 logging.info(
                     f"Epoch {epoch}, Step {current_steps}/{total_steps_per_epoch}, Loss: {loss.item():.4f}, CER: {cer:.4f}"
                 )
@@ -259,10 +262,15 @@ if __name__ == "__main__":
                 mask = mask.to(device)
                 logits, l = model(pad_x, viet_texts, pad_y_shift, mask)
                 pad_y_shift = pad_y_shift.to("cpu")
-                cer = compute_avg_cer(
-                    greedy_decoding(logits, id_to_token),
-                    pad_y_shift_to_string(pad_y_shift, id_to_token),
-                ) * len(viet_texts)
+                predictions, gt = greedy_decoding(logits, mask, id_to_token), pad_y_shift_to_string(pad_y_shift, mask, id_to_token, False),
+                
+                if args.save_res_path is not None:
+                    with open(args.save_res_path, "a") as f:
+                        f.write(f"\n======EPOCH {epoch+1}/{args.epochs}======\n")
+                        for pred, truth in zip(predictions, gt):
+                            f.write(f"Prediction: {pred}\tGround Truth: {truth}\n")
+                
+                cer = compute_avg_cer(predictions, gt) * len(viet_texts)
                 val_cer += cer
         avg_val_cer = val_cer / len(val_dl)
         logging.info(

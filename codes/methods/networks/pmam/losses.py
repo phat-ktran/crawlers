@@ -8,7 +8,7 @@ class DecodingLoss(nn.Module):
         self.pad_idx = pad_idx
         self.scale = scale_factor
 
-    def forward(self, logits, targets):
+    def forward(self, logits, targets, l, b, mask):
         return self.scale * F.cross_entropy(
             logits.transpose(1, 2), targets, ignore_index=self.pad_idx
         )
