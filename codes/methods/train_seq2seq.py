@@ -262,7 +262,7 @@ if __name__ == "__main__":
                 mask = mask.to(device)
                 logits, l = model(pad_x, viet_texts, pad_y_shift, mask)
                 pad_y_shift = pad_y_shift.to("cpu")
-                predictions, gt = greedy_decoding(logits, mask, id_to_token), pad_y_shift_to_string(pad_y_shift, mask, id_to_token, False),
+                predictions, gt = greedy_decoding(logits, mask, id_to_token), pad_y_shift_to_string(pad_y_shift, mask, id_to_token),
                 
                 if args.save_res_path is not None:
                     with open(args.save_res_path, "a") as f:
