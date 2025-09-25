@@ -9,17 +9,47 @@ from typing import Dict, List
 import csv
 
 from codes.methods.networks.confusionset_pointer_net import ConfusionPointerNet
+from codes.methods.utils import (
+    token2str,
+    SOS_ID,
+    PAD_ID,
+    EOS_ID,
+    UNK_ID,
+)
 
 
 def build_confusion_mask(
-    batch_src_ids: torch.Tensor, vocab_size: int, conf_map: Dict[int, List[int]]
+    batch_src_ids: torch.Tensor,
+    batch_viet_seqs: List[List[str]],
+    vocab_size: int,
+    conf_map: Dict[str, List[int]],
 ):
+    """
+    batch_src_ids: (B, n) tensor of Sino-Nôm token IDs
+    batch_viet_seqs: list of Vietnamese tokenized sequences, len = B
+    vocab_size: size of vocab
+    conf_map: dictionary {viet_word: [candidate_sino_ids]}
+    """
     B, n = batch_src_ids.size()
     mask = torch.zeros((B, n, vocab_size), dtype=torch.uint8)
+
     for b in range(B):
+        viet_words = batch_viet_seqs[b]  # list of tokens
         for i in range(n):
             cid = batch_src_ids[b, i].item()
-            allowed = conf_map.get(cid, [])
+            if cid in {PAD_ID, SOS_ID, EOS_ID, UNK_ID}:
+                continue
+
+            # If we have a Vietnamese word aligned at position i
+            if i < len(viet_words):
+                viet_word = viet_words[i]
+                allowed = conf_map.get(viet_word, [])
+            else:
+                allowed = []
+
+            # Always allow the original char id (so identity is possible)
+            allowed = set(allowed) | {cid}
+
             for a in allowed:
                 mask[b, i, a] = 1
     return mask
@@ -27,12 +57,19 @@ def build_confusion_mask(
 
 class CorrectionDataset(Dataset):
     def __init__(self, data, stoi):
+        """
+        data: list of (error_seq, gt_seq, viet_seq)
+        stoi: vocab mapping {char: id}
+        """
         self.samples = []
-        self.pad_idx = len(stoi)
         for error_seq, gt_seq, viet_seq in data:
-            src_ids = [stoi.get(c, self.pad_idx) for c in error_seq]
-            tgt_ids = [stoi.get(c, self.pad_idx) for c in gt_seq]
-            self.samples.append((src_ids, tgt_ids))
+            src_ids = [stoi.get(c, UNK_ID) for c in error_seq]
+            tgt_ids = [stoi.get(c, UNK_ID) for c in gt_seq]
+
+            # add <SOS> and <EOS> for the target
+            tgt_ids = [SOS_ID] + tgt_ids + [EOS_ID]
+
+            self.samples.append((src_ids, tgt_ids, viet_seq))
 
     def __len__(self):
         return len(self.samples)
@@ -42,21 +79,38 @@ class CorrectionDataset(Dataset):
 
 
 def collate_fn(batch, V, conf_map):
-    srcs, tgts = zip(*batch)
+    """
+    batch: list of (src_ids, tgt_ids, viet_seq)
+    V: vocab size
+    conf_map: confusion mapping (viet_word -> sino_candidates)
+    """
+    srcs, tgts, viet_seqs = zip(*batch)
+
+    # Pad source
     padded_src = pad_sequence(
         [torch.tensor(s, dtype=torch.long) for s in srcs],
         batch_first=True,
-        padding_value=V,
+        padding_value=PAD_ID,
     )
+
+    # Pad target (with <SOS>, <EOS>)
     padded_tgt = pad_sequence(
         [torch.tensor(t, dtype=torch.long) for t in tgts],
         batch_first=True,
-        padding_value=V,
+        padding_value=PAD_ID,
     )
-    src_mask = (padded_src != V).long()
-    conf_mask = build_confusion_mask(padded_src, V, conf_map)
-    return padded_src, src_mask, conf_mask, padded_tgt
 
+    # Build shifted target for teacher forcing
+    y_shift = padded_tgt[:, :-1]
+    y = padded_tgt[:, 1:]
+
+    # Source mask
+    src_mask = (padded_src != PAD_ID).long()
+
+    # Confusion mask (use viet seqs)
+    conf_mask = build_confusion_mask(padded_src, viet_seqs, V, conf_map)
+
+    return padded_src, src_mask, conf_mask, y_shift, y, list(viet_seqs)
 
 def load_data(file_path):
     data = []
@@ -68,7 +122,7 @@ def load_data(file_path):
                 # Treat sequences as lists of characters
                 error_list = list(error_seq.strip())
                 gt_list = list(gt_seq.strip())
-                viet_list = list(viet_seq.strip())
+                viet_list = viet_seq.strip().split()
                 data.append((error_list, gt_list, viet_list))
     return data
 
@@ -107,9 +161,9 @@ def main():
         "--output-dir", required=True, help="Directory to save logs and checkpoints."
     )
     parser.add_argument(
-        "--confusion",
-        default="codes/assets/similarity.csv",
-        help="CSV file for confusion network (sep ':').",
+        "--dict",
+        default="codes/assets/dict.csv",
+        help="CSV file for dict (sep ':').",
     )
     parser.add_argument(
         "--batch-size",
@@ -123,6 +177,7 @@ def main():
         default=None,
         help="Pretrained weights for character embeddings.",
     )
+    parser.add_argument("--save_res_path", type=str, default=None)
     args = parser.parse_args()
 
     os.makedirs(args.output_dir, exist_ok=True)
@@ -137,33 +192,31 @@ def main():
     logging.info("Starting training process.")
 
     # Load vocabulary
+    vocab = {"<pad>": PAD_ID, "<unk>": UNK_ID, "<sos>": SOS_ID, "<eos>": EOS_ID}
     with open(args.vocab, "r", encoding="utf-8") as f:
-        vocab = [line.strip() for line in f if line.strip()]
-    stoi = {c: i for i, c in enumerate(vocab)}
+        for line in f:
+            if line.strip():
+                vocab[line.strip()] = len(vocab)
     V = len(vocab)
     logging.info(f"Vocabulary size: {V}")
+    
+    id2token = {v: k for k, v in vocab.items()}
 
     # Load confusion map
-    conf_map: Dict[int, List[int]] = {}
-    with open(args.confusion, "r", encoding="utf-8") as f:
-        reader = csv.reader(f, delimiter=":")
+    conf_map: Dict[str, List[int]] = {}
+    with open(args.dict, "r", encoding="utf-8") as f:
+        reader = csv.reader(f, delimiter=",")
         next(reader)  # Skip header
         for row in reader:
             if len(row) == 2:
-                char = row[0].strip()
-                conf_str = row[1].strip()
-                confs = list(conf_str)
-                if char in stoi:
-                    conf_ids = [stoi[c] for c in confs if c in stoi]
-                    conf_map[stoi[char]] = conf_ids
-
-    # Add self to all confusion sets
-    for i in range(V):
-        if i not in conf_map:
-            conf_map[i] = [i]
-        elif i not in conf_map[i]:
-            conf_map[i].append(i)
-    logging.info(f"Loaded confusion map with {len(conf_map)} entries.")
+                vn = row[0].strip()
+                nom = row[1].strip()
+                if nom not in vocab:
+                    continue
+                if vn not in conf_map:
+                    conf_map[vn] = []
+                conf_map[vn].append(vocab[nom])
+    logging.info(f"Loaded dictionary with {len(conf_map)} entries.")
 
     # Load datasets
     train_data = load_data(args.train)
@@ -173,8 +226,8 @@ def main():
     )
 
     # Datasets and DataLoaders
-    train_ds = CorrectionDataset(train_data, stoi)
-    val_ds = CorrectionDataset(val_data, stoi)
+    train_ds = CorrectionDataset(train_data, vocab)
+    val_ds = CorrectionDataset(val_data, vocab)
     train_loader = DataLoader(
         train_ds,
         batch_size=args.batch_size,
@@ -213,7 +266,7 @@ def main():
         model.train()
         train_loss = 0.0
         for step, batch in enumerate(train_loader, 1):
-            src, src_mask, conf_mask, tgt = [x.to(device) for x in batch]
+            src, src_mask, conf_mask, tgt = [x.to(device) for x in batch[:4]]
             optimizer.zero_grad()
             outputs = model(src, src_mask, conf_mask, tgt_ids=tgt, teacher_forcing=True)
             loss = outputs["loss"]
@@ -226,13 +279,13 @@ def main():
                 pred_ids = outputs["pred_ids"]  # (B, seq_len)
                 B = pred_ids.size(0)
                 for b in range(B):
-                    pred_list = pred_ids[b][pred_ids[b] != V].tolist()
-                    tgt_list = tgt[b][tgt[b] != V].tolist()
+                    pred_list = pred_ids[b][pred_ids[b] != PAD_ID].tolist()
+                    tgt_list = tgt[b][tgt[b] != PAD_ID].tolist()
                     dist = levenshtein_distance(pred_list, tgt_list)
                     cer = dist / len(tgt_list) if len(tgt_list) > 0 else 0.0
                     cer_list.append(cer)
                 avg_cer = sum(cer_list) / len(cer_list) if cer_list else 0.0
-                
+
                 logging.info(f"Epoch {epoch + 1}, Step {step}: Loss = {loss.item()}, CER = {avg_cer:0.4f}")
 
         logging.info(f"Completed epoch {epoch + 1}/{args.epochs}, moving to validation.")
@@ -240,6 +293,11 @@ def main():
         # Validation
         model.eval()
         with torch.no_grad():
+            f = None
+            if args.save_res_path is not None:
+                f = open(args.save_res_path, "a")
+                f.write(f"\n======EPOCH {epoch+1}/{args.epochs}======\n")
+                
             cer_list = []
             for batch in val_loader:
                 src, src_mask, conf_mask, tgt = [x.to(device) for x in batch]
@@ -249,11 +307,20 @@ def main():
                 pred_ids = outputs["pred_ids"]  # (B, seq_len)
                 B = pred_ids.size(0)
                 for b in range(B):
-                    pred_list = pred_ids[b][pred_ids[b] != V].tolist()
-                    tgt_list = tgt[b][tgt[b] != V].tolist()
+                    pred_list = pred_ids[b][pred_ids[b] != PAD_ID].tolist()
+                    tgt_list = tgt[b][tgt[b] != PAD_ID].tolist()
                     dist = levenshtein_distance(pred_list, tgt_list)
+                    
+                    pred = token2str(pred_list, src_mask[b], id2token, training=True)[:-1]
+                    truth = token2str(tgt_list, src_mask[b], id2token, training=True)
+                    
+                    if f is not None:
+                        f.write(f"Prediction: {pred}\tGround Truth: {truth}\n")
+                    
                     cer = dist / len(tgt_list) if len(tgt_list) > 0 else 0.0
                     cer_list.append(cer)
+            if f is not None:
+                f.close()
             avg_cer = sum(cer_list) / len(cer_list) if cer_list else 0.0
         logging.info(f"Epoch {epoch + 1}/{args.epochs}: CER = {avg_cer}")
 

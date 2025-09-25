@@ -5,7 +5,9 @@ import torch.nn as nn
 import torch.nn.functional as F
 from typing import Dict, List, Optional
 
-from ..embeddings.cbow import CBOW
+from codes.methods.utils import PAD_ID
+
+from codes.methods.embeddings.cbow import CBOW
 
 # ----------------------------
 # Utility: masked softmax
@@ -53,7 +55,7 @@ class ConfusionPointerNet(nn.Module):
         super().__init__()
         self.vocab_size = vocab_size
         self.emb_dim = embed_dim
-        self.embed = nn.Embedding(vocab_size + 1, embed_dim, padding_idx=vocab_size)
+        self.embed = nn.Embedding(vocab_size, embed_dim, padding_idx=PAD_ID)
 
         # Encoder: BiLSTM
         self.enc_hidden = enc_hidden
@@ -94,7 +96,7 @@ class ConfusionPointerNet(nn.Module):
         self.dropout = nn.Dropout(drop_rate)
 
         # sentinel handling is internal; no external token needed
-        self.pad_idx = vocab_size
+        self.pad_idx = PAD_ID
         self._init_weights()
 
     def _init_weights(self):
@@ -128,14 +130,13 @@ class ConfusionPointerNet(nn.Module):
                     start, end = n // 4, n // 2
                     param.data[start:end].fill_(1.0)
                 
-    def load_pretrained_embeddings(self, path):
+    def load_pretrained_embeddings(self, path: str):
         if not os.path.exists(path):
             raise FileNotFoundError(f"Pretrained embeddings file not found at {path}")
         pretrained_weights = torch.load(path, map_location=torch.device('cpu'))
-        cbow = CBOW(self.vocab_size, self.emb_dim)
+        cbow = CBOW(self.vocab_size - 4, self.emb_dim)
         cbow.load_state_dict(pretrained_weights)
-        logging.info("Pretrained embeddings loaded successfully.")
-        self.embed.weight.data.copy_(cbow.in_embed.weight.data)
+        self.embed.weight.data[-(self.vocab_size - 4):, :].copy_(cbow.in_embed.weight.data[:-1, :])
 
     def encode(self, src_ids: torch.Tensor, src_mask: torch.Tensor):
         """
@@ -214,7 +215,6 @@ class ConfusionPointerNet(nn.Module):
         vocab_logits_all = []
         loss_pointer = 0.0
         loss_gen = 0.0
-        nn.CrossEntropyLoss(reduction="sum", ignore_index=-100)  # we'll manage masking
 
         for j in range(n):
             # prepare input embedding

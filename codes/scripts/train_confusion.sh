@@ -4,7 +4,8 @@ uv run -m codes.methods.train_confusion \
     --epochs 100 \
     --batch-size 64 \
     --lr 0.001 \
-    --confusion data/postprocess/similarity.csv \
+    --dict data/postprocess/dict.csv \
     --output-dir data/postprocess/models/confusion_net/ \
     --vocab data/postprocess/vocab.txt \
-    --pretrained-embs data/postprocess/embeddings/best.pt
+    --pretrained-embs data/postprocess/embeddings/best.pt \
+    --save_res_path data/postprocess/models/confusion_net/results.txt
