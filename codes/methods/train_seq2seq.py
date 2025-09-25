@@ -254,6 +254,11 @@ if __name__ == "__main__":
         model.eval()
         val_cer = 0.0
         with torch.no_grad():
+            f = None
+            if args.save_res_path is not None:
+                f = open(args.save_res_path, "a")
+                f.write(f"\n======EPOCH {epoch+1}/{args.epochs}======\n")
+                
             for pad_x, pad_y_shift, pad_y, pad_b, viet_texts, mask in val_dl:
                 pad_x = pad_x.to(device)
                 pad_y_shift = pad_y_shift.to(device)
@@ -264,19 +269,21 @@ if __name__ == "__main__":
                 pad_y_shift = pad_y_shift.to("cpu")
                 predictions, gt = greedy_decoding(logits, mask, id_to_token), pad_y_shift_to_string(pad_y_shift, mask, id_to_token),
                 
-                if args.save_res_path is not None:
-                    with open(args.save_res_path, "a") as f:
-                        f.write(f"\n======EPOCH {epoch+1}/{args.epochs}======\n")
-                        for pred, truth in zip(predictions, gt):
-                            f.write(f"Prediction: {pred}\tGround Truth: {truth}\n")
+                if f is not None:
+                    for pred, truth in zip(predictions, gt):
+                        f.write(f"Prediction: {pred}\tGround Truth: {truth}\n")
                 
                 cer = compute_avg_cer(predictions, gt) * len(viet_texts)
                 val_cer += cer
-        avg_val_cer = val_cer / len(val_dl)
+            
+            if f is not None:
+                f.close()
+            
+        avg_val_cer = val_cer / len(val_ds)
         logging.info(
             f"Epoch {epoch} Summary:\n"
             f"  Validation CER: {avg_val_cer:.4f}\n"
-            f"  Total Validation Samples: {len(val_dl) * args.batch_size}\n"
+            f"  Total Validation Samples: {len(val_ds)}\n"
             f"  Learning Rate: {optimizer.param_groups[0]['lr']:.6f}"
         )
 
