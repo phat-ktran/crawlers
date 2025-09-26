@@ -8,7 +8,7 @@ import logging
 from typing import Dict, List
 import csv
 
-from codes.methods.networks.confusionset_pointer_net import ConfusionPointerNet
+from codes.methods.networks.confusionset_pointer_net_vectorized import ConfusionPointerNetVectorized
 from codes.methods.utils import (
     SOS_ID,
     PAD_ID,
@@ -175,7 +175,7 @@ def levenshtein_distance(s1, s2):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Train ConfusionPointerNet model.")
+    parser = argparse.ArgumentParser(description="Train ConfusionPointerNetVectorized model.")
     parser.add_argument("--train", required=True, help="Path to training dataset.")
     parser.add_argument("--val", required=True, help="Path to validation dataset.")
     parser.add_argument(
@@ -280,7 +280,7 @@ def main():
     )
 
     # Model, optimizer, device
-    model = ConfusionPointerNet(
+    model = ConfusionPointerNetVectorized(
         vocab_size=V,
         embed_dim=256,
         enc_hidden=384,
