@@ -291,7 +291,7 @@ if __name__ == "__main__":
         )
 
         ckpt_path = os.path.join(
-            args.output_dir, "checkpoints", f"iter_epoch_{epoch}.pt"
+            args.output_dir, f"iter_epoch_{epoch}.pt"
         )
         torch.save(
             {
