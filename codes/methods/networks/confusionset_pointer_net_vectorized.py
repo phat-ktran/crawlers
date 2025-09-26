@@ -7,6 +7,7 @@ from typing import Dict, List, Optional
 from codes.methods.utils import PAD_ID
 
 from codes.methods.embeddings.cbow import CBOW
+from codes.methods.networks.pmam.attn import TransformBlock
 
 
 # ----------------------------
@@ -46,6 +47,7 @@ class ConfusionPointerNetVectorized(nn.Module):
         ptr_dim: int = 128,
         drop_rate: float = 0.2,
         sentinel_token_id: Optional[int] = None,
+        transform: Optional[TransformBlock] = None,
     ):
         """
         Vectorized version of ConfusionPointerNet with optimized forward pass.
@@ -69,6 +71,7 @@ class ConfusionPointerNetVectorized(nn.Module):
             batch_first=True,
             bidirectional=True,
         )
+        self.transform = transform
 
         # Decoder: single-layer LSTM
         self.dec_hidden = dec_hidden
@@ -151,7 +154,11 @@ class ConfusionPointerNetVectorized(nn.Module):
         return enc_hs, (h_n, c_n)
 
     def batch_attention(
-        self, dec_h: torch.Tensor, enc_hs: torch.Tensor, enc_mask: torch.Tensor
+        self,
+        dec_h: torch.Tensor,
+        enc_hs: torch.Tensor,
+        enc_mask: torch.Tensor,
+        viet_texts: List,
     ):
         """
         Vectorized attention computation.
@@ -163,13 +170,21 @@ class ConfusionPointerNetVectorized(nn.Module):
             attn_weights: (B, max_len, n)
         """
         B, max_len, _ = dec_h.size()
+        device = dec_h.device
         _, n, enc_dim = enc_hs.size()
 
         # Expand decoder hidden states for all positions
         dec_term = (
             self.W1(dec_h).unsqueeze(2).expand(-1, -1, n, -1)
         )  # (B, max_len, n, attn_dim)
+
         # Expand encoder hidden states for all decoder positions
+        l = None
+        if self.transform:
+            joined_viet_texts = [" ".join(viet_text) for viet_text in viet_texts]
+            _, enc_hs, l = (
+                self.transform(enc_hs, joined_viet_texts, device, enc_mask)
+            )
         enc_term = (
             self.W2(enc_hs).unsqueeze(1).expand(-1, max_len, -1, -1)
         )  # (B, max_len, n, attn_dim)
@@ -195,7 +210,7 @@ class ConfusionPointerNetVectorized(nn.Module):
         )  # (B, max_len, enc_dim)
         context = self.dropout_c(context)
 
-        return context, alpha
+        return context, alpha, l
 
     def compute_pointer_logits(
         self, combined: torch.Tensor, src_mask: torch.Tensor, max_len: int
@@ -370,9 +385,13 @@ class ConfusionPointerNetVectorized(nn.Module):
         if valid_mask.any():
             # Flatten for loss computation
             flat_valid_mask = valid_mask.reshape(-1)  # (B*max_len,)
-            flat_pointer_logits = pointer_logits.reshape(-1, n_plus_1)  # (B*max_len, n+1)
+            flat_pointer_logits = pointer_logits.reshape(
+                -1, n_plus_1
+            )  # (B*max_len, n+1)
             flat_labels_pos = labels_pos.reshape(-1)  # (B*max_len,)
-            flat_vocab_logits = vocab_logits.reshape(-1, self.vocab_size)  # (B*max_len, V)
+            flat_vocab_logits = vocab_logits.reshape(
+                -1, self.vocab_size
+            )  # (B*max_len, V)
             flat_targets = targets.reshape(-1)  # (B*max_len,)
 
             valid_indices = flat_valid_mask.nonzero(as_tuple=False).squeeze(1)
@@ -405,6 +424,7 @@ class ConfusionPointerNetVectorized(nn.Module):
         src_ids: torch.Tensor,
         src_mask: torch.Tensor,
         confusionset_mask: torch.Tensor,
+        viet_texts,
         tgt_ids: Optional[torch.Tensor] = None,
         teacher_forcing: bool = True,
     ) -> Dict[str, torch.Tensor]:
@@ -472,7 +492,9 @@ class ConfusionPointerNetVectorized(nn.Module):
             all_dec_h[:, j, :] = dec_h
 
         # Vectorized attention computation
-        context, attention_weights = self.batch_attention(all_dec_h, enc_hs, src_mask)
+        context, attention_weights, l = self.batch_attention(
+            all_dec_h, enc_hs, src_mask, viet_texts
+        )
 
         # Combine decoder hidden and context
         combined = torch.tanh(
@@ -516,6 +538,7 @@ class ConfusionPointerNetVectorized(nn.Module):
             "pred_ids": pred_ids,
             "pointer_logits": all_pointer_logits,
             "vocab_logits": all_vocab_logits,
+            "det_logits": l,
         }
 
         # Compute loss if targets provided

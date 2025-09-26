@@ -8,6 +8,7 @@ import logging
 from typing import Dict, List
 import csv
 
+from codes.methods.networks.pmam.losses import MCGLoss
 from codes.methods.networks.confusionset_pointer_net_vectorized import ConfusionPointerNetVectorized
 from codes.methods.utils import (
     SOS_ID,
@@ -95,14 +96,15 @@ class CorrectionDataset(Dataset):
         stoi: vocab mapping {char: id}
         """
         self.samples = []
-        for error_seq, gt_seq, viet_seq in data:
+        for error_seq, gt_seq, bbs, viet_seq in data:
             src_ids = [stoi.get(c, UNK_ID) for c in error_seq]
             gt_ids = [stoi.get(c, UNK_ID) for c in gt_seq]
 
             # add <SOS> and <EOS> for the target
             tgt_ids = [SOS_ID] + gt_ids + [EOS_ID]
+            b = [int(bb) for bb in bbs.split(",")]
 
-            self.samples.append((src_ids, tgt_ids, viet_seq))
+            self.samples.append((src_ids, tgt_ids, b, viet_seq))
 
     def __len__(self):
         return len(self.samples)
@@ -117,7 +119,7 @@ def collate_fn(batch, V, conf_map):
     V: vocab size
     conf_map: confusion mapping (viet_word -> sino_candidates)
     """
-    srcs, tgts, viet_seqs = zip(*batch)
+    srcs, tgts, bs, viet_seqs = zip(*batch)
 
     # Pad source
     padded_src = pad_sequence(
@@ -132,6 +134,12 @@ def collate_fn(batch, V, conf_map):
         batch_first=True,
         padding_value=PAD_ID,
     )
+    
+    padded_b = pad_sequence(
+        [torch.tensor(b, dtype=torch.long) for b in bs],
+        batch_first=True,
+        padding_value=PAD_ID,
+    )
 
     # Source mask
     src_mask = (padded_src != PAD_ID).long()
@@ -139,7 +147,7 @@ def collate_fn(batch, V, conf_map):
     # Confusion mask (use viet seqs)
     conf_mask = build_confusion_mask(padded_src, viet_seqs, V, conf_map)
 
-    return padded_src, src_mask, conf_mask, padded_tgt, list(viet_seqs)
+    return padded_src, src_mask, conf_mask, padded_tgt, padded_b, list(viet_seqs)
 
 
 def load_data(file_path):
@@ -148,12 +156,12 @@ def load_data(file_path):
         for line in f:
             parts = line.strip().split("\t")
             if len(parts) == 4:
-                error_seq, gt_seq, _, viet_seq = parts
+                error_seq, gt_seq, bbs, viet_seq = parts
                 # Treat sequences as lists of characters
                 error_list = list(error_seq.strip())
                 gt_list = list(gt_seq.strip())
                 viet_list = viet_seq.strip().split()
-                data.append((error_list, gt_list, viet_list))
+                data.append((error_list, gt_list, bbs, viet_list))
     return data
 
 
@@ -206,6 +214,9 @@ def main():
         type=int,
         default=8,
         help="Workers for training and validation.",
+    )
+    parser.add_argument(
+        "--transform", type=str, choices=["None", "PMAMWithBERT"], default="None"
     )
     parser.add_argument(
         "--pretrained-embs",
@@ -280,6 +291,19 @@ def main():
     )
 
     # Model, optimizer, device
+    transform = None
+    if args.transform != "None":
+        from codes.methods.networks.pmam.encoders import PhoBERTEncoder
+        from codes.methods.networks.pmam.attn import PMAMWithBERT
+        transform = PMAMWithBERT(
+            hidden_size=384,
+            gate_hid=256,
+            att_dim=768,
+            att_heads=8,
+            phonetic_enc=PhoBERTEncoder()
+        )
+        
+    
     model = ConfusionPointerNetVectorized(
         vocab_size=V,
         embed_dim=256,
@@ -287,6 +311,7 @@ def main():
         dec_hidden=384,
         attn_dim=384,
         drop_rate=0.5,
+        transform=transform
     )
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model.to(device)
@@ -302,6 +327,8 @@ def main():
         patience=1,      # wait 1 epoch
         min_lr=1e-4
     )
+    
+    mcg_loss_fn = MCGLoss(PAD_ID, scale_factor=2.5)
     logging.info(f"Using device: {device}")
 
     # Training loop
@@ -314,10 +341,15 @@ def main():
         model.train()
         train_loss = 0.0
         for step, batch in enumerate(train_loader, 1):
-            src, src_mask, conf_mask, tgt = [x.to(device) for x in batch[:4]]
+            src, src_mask, conf_mask, tgt, pad_b = [x.to(device) for x in batch[:5]]
+            viet_texts = batch[-1]
             optimizer.zero_grad()
-            outputs = model(src, src_mask, conf_mask, tgt_ids=tgt, teacher_forcing=True)
+            outputs = model(src, src_mask, conf_mask, viet_texts, tgt_ids=tgt, teacher_forcing=True)
             loss = outputs["loss"]
+            l = outputs["det_logits"]
+            if l is not None:
+                loss += mcg_loss_fn(None, None, l, pad_b.float(), src_mask)
+            
             loss.backward()
             optimizer.step()
             train_loss += loss.item()
@@ -351,7 +383,7 @@ def main():
                 avg_cer = sum(cer_list) / len(cer_list) if cer_list else 0.0
 
                 logging.info(
-                    f"Epoch {epoch + 1}, Step {step}: Loss = {loss.item()}, CER = {avg_cer:0.4f}"
+                    f"Epoch {epoch + 1}, Step {step}: Loss = {loss.item()}, CER = {avg_cer:0.4f}, LR = {optimizer.param_groups[0]['lr']}"
                 )
 
         logging.info(
