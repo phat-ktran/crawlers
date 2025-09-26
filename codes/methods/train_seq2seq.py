@@ -195,6 +195,13 @@ if __name__ == "__main__":
         model.load_pretrained_embeddings(args.embeddings)
 
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=1e-5)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer,
+        mode='min',      # because we track CER
+        factor=0.75,      # halve LR
+        patience=1,      # wait 1 epoch
+        min_lr=1e-4
+    )
     # l2_lambda = 1e-5
     decoding_loss_fn = DecodingLoss(PAD_ID, scale_factor=1.0)
     mcg_loss_fn = MCGLoss(PAD_ID, scale_factor=args.scale)
@@ -284,6 +291,7 @@ if __name__ == "__main__":
                 f.close()
 
         avg_val_cer = val_cer / len(val_ds)
+        scheduler.step(avg_val_cer)
         logging.info(
             f"Epoch {epoch} Summary:\n"
             f"  Validation CER: {avg_val_cer:.4f}\n"

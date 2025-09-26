@@ -16,18 +16,40 @@ from codes.methods.utils import (
     UNK_ID,
 )
 
+
 def token2str(ids, mask, id2token, training=False):
     """
-    Convert list of IDs to string, ignoring special tokens and truncating at EOS.
-    The mask and training parameters are retained for compatibility but unused.
+    Convert list of IDs to string, handling special tokens properly.
+
+    Args:
+        ids: list of token IDs
+        mask: list of 1/0 indicating valid positions (can be None)
+        id2token: dictionary mapping IDs to characters
+        training: whether this is for training targets (affects SOS handling)
     """
+    if mask is None:
+        mask = [1] * len(ids)
+
     filtered_ids = []
-    for i in ids:
-        if i == EOS_ID:
+    for idx, (token_id, m) in enumerate(zip(ids, mask)):
+        if m == 0:  # masked position (padding)
+            continue
+        if token_id == PAD_ID:
+            continue
+        if token_id == EOS_ID:  # stop at EOS
             break
-        if i not in {SOS_ID, PAD_ID, UNK_ID}:
-            filtered_ids.append(i)
-    return ''.join(id2token.get(i, '<unk>') for i in filtered_ids)
+        if (
+            training and idx == 0 and token_id == SOS_ID
+        ):  # skip SOS at start for training targets
+            continue
+        if not training and token_id == SOS_ID:  # skip SOS for predictions too
+            continue
+        if token_id == UNK_ID:
+            filtered_ids.append("<unk>")
+        else:
+            filtered_ids.append(id2token.get(token_id, "<unk>"))
+    return "".join(filtered_ids)
+
 
 def build_confusion_mask(
     batch_src_ids: torch.Tensor,
@@ -111,18 +133,14 @@ def collate_fn(batch, V, conf_map):
         padding_value=PAD_ID,
     )
 
-    # Build shifted target for teacher forcing
-    y_shift = padded_tgt[:, :-1]
-    y = padded_tgt[:, 1:]
-
     # Source mask
     src_mask = (padded_src != PAD_ID).long()
-    
 
     # Confusion mask (use viet seqs)
     conf_mask = build_confusion_mask(padded_src, viet_seqs, V, conf_map)
 
-    return padded_src, src_mask, conf_mask, y_shift, y, list(viet_seqs)
+    return padded_src, src_mask, conf_mask, padded_tgt, list(viet_seqs)
+
 
 def load_data(file_path):
     data = []
@@ -211,7 +229,7 @@ def main():
                 vocab[line.strip()] = len(vocab)
     V = len(vocab)
     logging.info(f"Vocabulary size: {V}")
-    
+
     id2token = {v: k for k, v in vocab.items()}
 
     # Load confusion map
@@ -260,15 +278,22 @@ def main():
         enc_hidden=384,
         dec_hidden=384,
         attn_dim=384,
-        drop_rate=0.5
+        drop_rate=0.5,
     )
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model.to(device)
-    
+
     if args.pretrained_embs:
         model.load_pretrained_embeddings(args.pretrained_embs)
-    
+
     optimizer = optim.Adam(model.parameters(), lr=args.lr, weight_decay=1e-5)
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer,
+        mode='min',      # because we track CER
+        factor=0.75,      # halve LR
+        patience=1,      # wait 1 epoch
+        min_lr=1e-4
+    )
     logging.info(f"Using device: {device}")
 
     # Training loop
@@ -278,46 +303,49 @@ def main():
         model.train()
         train_loss = 0.0
         for step, batch in enumerate(train_loader, 1):
-            src, src_mask, conf_mask, tgt, y = [x.to(device) for x in batch[:5]]
+            src, src_mask, conf_mask, tgt = [x.to(device) for x in batch[:4]]
             optimizer.zero_grad()
             outputs = model(src, src_mask, conf_mask, tgt_ids=tgt, teacher_forcing=True)
             loss = outputs["loss"]
             loss.backward()
             optimizer.step()
             train_loss += loss.item()
-            
+
             if step % 10 == 0:
                 cer_list = []
                 pred_ids = outputs["pred_ids"]  # (B, seq_len)
                 B = pred_ids.size(0)
+                # Extract ground truth from target (skip SOS, take until EOS)
+                y = tgt[:, 1:]  # Skip SOS token
                 for b in range(B):
-                    pred_list_full = pred_ids[b][pred_ids[b] != PAD_ID].tolist()
-                    y_list_full = y[b][y[b] != PAD_ID].tolist()
-                    
-                    # Truncate at first EOS if present
-                    try:
-                        eos_idx_pred = pred_list_full.index(EOS_ID)
-                        pred_list = pred_list_full[:eos_idx_pred]
-                    except ValueError:
-                        pred_list = pred_list_full  # No EOS, use all
-                    
-                    try:
-                        eos_idx_y = y_list_full.index(EOS_ID)
-                        gt_list = y_list_full[:eos_idx_y]
-                    except ValueError:
-                        gt_list = y_list_full
-                    
-                    dist = levenshtein_distance(pred_list, gt_list)
-                    cer = dist / len(gt_list) if len(gt_list) > 0 else 0.0
+                    pred_list = pred_ids[b].tolist()
+                    y_list = y[b].tolist()
+
+                    # Create masks for valid positions (non-padding)
+                    pred_mask = [(1 if p != PAD_ID else 0) for p in pred_list]
+                    y_mask = [(1 if y_id != PAD_ID else 0) for y_id in y_list]
+
+                    # Convert to strings using token2str which handles EOS/SOS/PAD properly
+                    pred_str = token2str(pred_list, pred_mask, id2token, training=False)
+                    gt_str = token2str(y_list, y_mask, id2token, training=True)
+
+                    # Convert back to character lists for distance calculation
+                    pred_chars = list(pred_str)
+                    gt_chars = list(gt_str)
+
+                    dist = levenshtein_distance(pred_chars, gt_chars)
+                    cer = dist / len(gt_chars) if len(gt_chars) > 0 else 0.0
                     cer_list.append(cer)
-                
-                if f:
-                    f.close()
+
                 avg_cer = sum(cer_list) / len(cer_list) if cer_list else 0.0
 
-                logging.info(f"Epoch {epoch + 1}, Step {step}: Loss = {loss.item()}, CER = {avg_cer:0.4f}")
+                logging.info(
+                    f"Epoch {epoch + 1}, Step {step}: Loss = {loss.item()}, CER = {avg_cer:0.4f}"
+                )
 
-        logging.info(f"Completed epoch {epoch + 1}/{args.epochs}, moving to validation.")
+        logging.info(
+            f"Completed epoch {epoch + 1}/{args.epochs}, moving to validation."
+        )
 
         # Validation
         model.eval()
@@ -325,47 +353,45 @@ def main():
             f = None
             if args.save_res_path is not None:
                 f = open(args.save_res_path, "a")
-                f.write(f"\n======EPOCH {epoch+1}/{args.epochs}======\n")
-                
+                f.write(f"\n======EPOCH {epoch + 1}/{args.epochs}======\n")
+
             cer_list = []
             for batch in val_loader:
-                src, src_mask, conf_mask, tgt, y = [x.to(device) for x in batch[:5]]
+                src, src_mask, conf_mask, tgt = [x.to(device) for x in batch[:4]]
                 outputs = model(
-                    src, src_mask, conf_mask, tgt_ids=tgt, teacher_forcing=False
+                    src, src_mask, conf_mask, tgt_ids=None, teacher_forcing=False
                 )
                 pred_ids = outputs["pred_ids"]  # (B, seq_len)
                 B = pred_ids.size(0)
-                y_cpu = y.to("cpu")
+                # Extract ground truth from target (skip SOS, take until EOS)
+                y = tgt[:, 1:]  # Skip SOS token
                 for b in range(B):
-                    pred_list_full = pred_ids[b][pred_ids[b] != PAD_ID].tolist()
-                    y_list_full = y[b][y[b] != PAD_ID].tolist()
-                    
-                    # Truncate at first EOS if present
-                    try:
-                        eos_idx_pred = pred_list_full.index(EOS_ID)
-                        pred_list = pred_list_full[:eos_idx_pred]
-                    except ValueError:
-                        pred_list = pred_list_full  # No EOS, use all
-                    
-                    try:
-                        eos_idx_y = y_list_full.index(EOS_ID)
-                        gt_list = y_list_full[:eos_idx_y]
-                    except ValueError:
-                        gt_list = y_list_full
-                    
-                    dist = levenshtein_distance(pred_list, gt_list)                    
-                    pred = token2str(pred_list, None, id2token, training=False)
-                    truth = token2str(gt_list, None, id2token, training=False)
-                    
+                    pred_list = pred_ids[b].tolist()
+                    y_list = y[b].tolist()
+
+                    # Create masks for valid positions (non-padding)
+                    pred_mask = [(1 if p != PAD_ID else 0) for p in pred_list]
+                    y_mask = [(1 if y_id != PAD_ID else 0) for y_id in y_list]
+
+                    # Convert to strings using token2str which handles EOS/SOS/PAD properly
+                    pred = token2str(pred_list, pred_mask, id2token, training=False)
+                    truth = token2str(y_list, y_mask, id2token, training=True)
+
                     if f is not None:
                         f.write(f"Prediction: {pred}\tGround Truth: {truth}\n")
-                    
-                    cer = dist / len(gt_list) if len(gt_list) > 0 else 0.0
+
+                    # Convert to character lists for distance calculation
+                    pred_chars = list(pred)
+                    gt_chars = list(truth)
+
+                    dist = levenshtein_distance(pred_chars, gt_chars)
+                    cer = dist / len(gt_chars) if len(gt_chars) > 0 else 0.0
                     cer_list.append(cer)
             if f is not None:
                 f.close()
             avg_cer = sum(cer_list) / len(cer_list) if cer_list else 0.0
         logging.info(f"Epoch {epoch + 1}/{args.epochs}: CER = {avg_cer}")
+        scheduler.step(avg_cer)
 
         # Save checkpoint
         os.makedirs(os.path.join(args.output_dir, "checkpoints"), exist_ok=True)

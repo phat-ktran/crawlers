@@ -1,4 +1,3 @@
-import logging
 import os
 import torch
 import torch.nn as nn
@@ -8,6 +7,7 @@ from typing import Dict, List, Optional
 from codes.methods.utils import PAD_ID
 
 from codes.methods.embeddings.cbow import CBOW
+
 
 # ----------------------------
 # Utility: masked softmax
@@ -119,27 +119,29 @@ class ConfusionPointerNet(nn.Module):
                 nn.init.xavier_uniform_(l.weight)
             if hasattr(l, "bias") and l.bias is not None:
                 nn.init.constant_(l.bias, 0.0)
-                
+
         for m in [self.decoder_cell, self.encoder]:
             for name, param in m.named_parameters():
                 if "weight_ih" in name:
-                    nn.init.xavier_uniform_(param)   # input -> hidden
+                    nn.init.xavier_uniform_(param)  # input -> hidden
                 elif "weight_hh" in name:
-                    nn.init.orthogonal_(param)       # hidden -> hidden
+                    nn.init.orthogonal_(param)  # hidden -> hidden
                 elif "bias" in name:
                     nn.init.zeros_(param)
                     # optional: set forget-gate bias to 1 (common trick for LSTMs)
                     n = param.size(0)
                     start, end = n // 4, n // 2
                     param.data[start:end].fill_(1.0)
-                
+
     def load_pretrained_embeddings(self, path: str):
         if not os.path.exists(path):
             raise FileNotFoundError(f"Pretrained embeddings file not found at {path}")
-        pretrained_weights = torch.load(path, map_location=torch.device('cpu'))
+        pretrained_weights = torch.load(path, map_location=torch.device("cpu"))
         cbow = CBOW(self.vocab_size - 4, self.emb_dim)
         cbow.load_state_dict(pretrained_weights)
-        self.embed.weight.data[-(self.vocab_size - 4):, :].copy_(cbow.in_embed.weight.data[:-1, :])
+        self.embed.weight.data[-(self.vocab_size - 4) :, :].copy_(
+            cbow.in_embed.weight.data[:-1, :]
+        )
 
     def encode(self, src_ids: torch.Tensor, src_mask: torch.Tensor):
         """
@@ -194,7 +196,7 @@ class ConfusionPointerNet(nn.Module):
         src_mask: (B, n) 1/0 mask
         confusionset_mask: (B, n, V) binary mask: for each position i in input, which vocab ids belong to its confusionset.
                            NOTE: confusionset_mask[b, i] is a length-V binary mask for position i of sample b.
-        tgt_ids: (B, n) target character ids (same length as input, because model fixes length)
+        tgt_ids: (B, max_len) target character ids starting with SOS (for teacher forcing)
         teacher_forcing: if True (training) feed gold prev tokens to decoder; if False (inference) use predicted token
         Returns dict containing:
             'loss': scalar tensor if tgt_ids provided
@@ -210,23 +212,34 @@ class ConfusionPointerNet(nn.Module):
         dec_h = torch.zeros(B, self.dec_hidden, device=device)
         dec_c = torch.zeros(B, self.dec_hidden, device=device)
 
-        # initial input to decoder: typically <sos> or the first input char embedding; we follow paper structure where alignment is 1-1,
-        # so we feed previous target token embedding (teacher forcing) or previous predicted.
-        prev_input_ids = torch.full(
-            (B,), self.pad_idx, dtype=torch.long, device=device
-        )  # start with PAD token embedding
-        results_pred = []
-        pointer_logits_all = []
-        vocab_logits_all = []
-        loss_pointer = 0.0
-        loss_gen = 0.0
+        # Get max decoder length - use src length for alignment
+        max_decoder_len = n
 
-        for j in range(n):
+        # Start with SOS token (or first target token if available)
+        if tgt_ids is not None and teacher_forcing:
+            decoder_input = tgt_ids[:, 0]  # Start with SOS from target
+        else:
+            decoder_input = torch.full(
+                (B,), 2, dtype=torch.long, device=device
+            )  # SOS_ID = 2
+
+        all_vocab_logits = torch.zeros(
+            B, max_decoder_len, self.vocab_size, device=device
+        )
+        all_pointer_logits = torch.zeros(B, max_decoder_len, n + 1, device=device)
+        all_predict_words = []
+
+        total_loss = torch.tensor(0.0, device=device)
+
+        for j in range(max_decoder_len):
             # prepare input embedding
-            emb_prev = self.embed(prev_input_ids)  # (B, E)
+            emb_prev = self.embed(decoder_input)  # (B, E)
+            emb_prev = self.dropout_e(emb_prev)
+
             dec_h, dec_c = self.decoder_cell(
                 emb_prev, (dec_h, dec_c)
             )  # each (B, dec_hidden)
+
             # attention
             context, alpha = self.attention(
                 dec_h, enc_hs, src_mask
@@ -239,165 +252,144 @@ class ConfusionPointerNet(nn.Module):
 
             # --- Vocab logits ---
             vocab_logits = self.vocab_proj(combined)  # (B, V)
-            vocab_logits_all.append(vocab_logits.unsqueeze(1))  # collect per timestep
 
-            # --- Pointer logits (distribution over positions + sentinel) ---
-            # create Locj: vector of length n with 1 at position j (paper sets j-th element 1 at timestep j)
-            # For batch we create same Locj for all samples in batch (since decoding is position-synchronous)
-            # Locj is (B, n) (some samples might have padding, but Locj always index j)
+            # Apply confusion set mask if position j is valid
+            if j < n:
+                # Create masked vocab distribution
+                conf_mask_j = confusionset_mask[:, j, :]  # (B, V)
+                # Create a default mask for samples where confusion mask is all zeros
+                mask_sums = conf_mask_j.sum(dim=-1)  # (B,)
+                for b in range(B):
+                    if mask_sums[b] == 0:
+                        conf_mask_j[b, :] = 1  # Allow all vocab if no confusion set
+
+                # Apply mask by setting disallowed positions to -inf
+                masked_vocab_logits = vocab_logits.masked_fill(conf_mask_j == 0, -1e9)
+                vocab_probs = F.log_softmax(masked_vocab_logits, dim=-1)
+            else:
+                vocab_probs = F.log_softmax(vocab_logits, dim=-1)
+
+            all_vocab_logits[:, j, :] = vocab_probs
+
+            # --- Pointer logits ---
+            # create Locj: vector with 1 at position j
             Locj = torch.zeros(B, n, device=device)
             if j < n:
                 Locj[:, j] = 1.0
 
-            # The paper computes Lj = softmax(Wi[Wg Cj ; Locj]); we implement per-position scoring:
-            # For each encoder position i, we create input vector concat([scalar Locj_i for i], Cj) and compute score
-            # Instead we compute a score per encoder position by applying pointer_proj on each (Cj; Locj_i)
-            # Build (B, n, 1) where Locj_i is scalar per position
+            # Compute pointer distribution
             Locj_unsq = Locj.unsqueeze(-1)  # (B, n, 1)
-            # expand combined (Cj) to (B, n, dec_hidden)
             Cj_exp = combined.unsqueeze(1).expand(-1, n, -1)
             pointer_input = torch.cat(
                 [Cj_exp, Locj_unsq], dim=-1
             )  # (B, n, dec_hidden+1)
-            pointer_hidden = torch.tanh(self.pointer_proj(pointer_input))  # (B, n, 128)
+
+            pointer_hidden = torch.tanh(
+                self.pointer_proj(pointer_input)
+            )  # (B, n, ptr_dim)
             pointer_hidden = self.dropout_p(pointer_hidden)
-            pos_scores = self.pointer_score(pointer_hidden).squeeze(
-                -1
-            )  # (B, n) scores for each input position
-            # sentinel score: produce an extra logit for sentinel using a small MLP on combined
+            pos_scores = self.pointer_score(pointer_hidden).squeeze(-1)  # (B, n)
+
+            # sentinel score
             sentinel_logit = torch.tanh(self.Wg(combined)).sum(
                 dim=-1, keepdim=True
             )  # (B, 1)
             pointer_logits = torch.cat([pos_scores, sentinel_logit], dim=-1)  # (B, n+1)
-            # mask positions that are padding in src_mask: set to -inf
+
+            # mask padded positions
             pad_mask = torch.cat(
                 [src_mask, torch.ones(B, 1, device=device)], dim=1
-            )  # (B, n+1) allow sentinel
+            )  # (B, n+1)
             pointer_logits = pointer_logits.masked_fill(pad_mask == 0, -1e9)
-            pointer_logits_all.append(pointer_logits.unsqueeze(1))
+            F.softmax(pointer_logits, dim=-1)
 
-            # --- Loss computation for training if target provided ---
+            all_pointer_logits[:, j, :] = pointer_logits
+
+            # --- Make prediction for next step ---
+            # Pointer decision: copy from source or generate
+            ptr_choice = pointer_logits.argmax(dim=-1)  # (B,)
+            vocab_choice = vocab_probs.argmax(dim=-1)  # (B,)
+
+            # Decide based on pointer distribution
+            next_ids = torch.zeros_like(ptr_choice)
+            for b in range(B):
+                if ptr_choice[b] < n and j < src_mask[b].sum():  # copy from source
+                    pos = ptr_choice[b].item()
+                    next_ids[b] = src_ids[b, pos]
+                else:  # generate from vocab
+                    next_ids[b] = vocab_choice[b]
+
+            # Convert to word list (for compatibility)
+            batch_words = [str(next_ids[b].item()) for b in range(B)]
+            all_predict_words.append(batch_words)
+
+            # --- Loss computation ---
             if tgt_ids is not None:
-                # pointer location label Lloc_j:
-                # if target at timestep j exists in input: label = index of its (first) match in input positions
-                # otherwise label = n (index of sentinel) (0..n-1 are positions, n is sentinel)
-                # We'll find for each sample the first position z such that src_ids[b, z] == tgt_ids[b,j]
-                labels_pos = torch.full(
-                    (B,), n, dtype=torch.long, device=device
-                )  # default sentinel
+                # Target for this timestep (j+1 because tgt_ids starts with SOS)
+                if j + 1 < tgt_ids.size(1):
+                    target_j = tgt_ids[:, j + 1]  # (B,)
 
-                tgt_j = tgt_ids[:, j]  # (B,)
+                    # Compute pointer labels
+                    labels_pos = torch.full(
+                        (B,), n, dtype=torch.long, device=device
+                    )  # default: sentinel
 
-                # Only consider non-pad targets
+                    for b in range(B):
+                        if target_j[b] != PAD_ID and target_j[b] != 0:  # valid target
+                            # Find if target exists in source
+                            matches = (src_ids[b] == target_j[b]).nonzero(
+                                as_tuple=False
+                            )
+                            if matches.numel() > 0:
+                                labels_pos[b] = matches[0, 0].item()  # use first match
+                            # else: keep sentinel (n)
+
+                    # Pointer loss
+                    valid_mask = target_j != PAD_ID
+                    if valid_mask.any():
+                        pointer_loss_j = F.cross_entropy(
+                            pointer_logits[valid_mask],
+                            labels_pos[valid_mask],
+                            reduction="mean",
+                        )
+
+                        # Vocab loss (for positions that need generation)
+                        gen_mask = (labels_pos == n) & valid_mask
+                        if gen_mask.any():
+                            vocab_loss_j = F.cross_entropy(
+                                vocab_probs[gen_mask],
+                                target_j[gen_mask],
+                                reduction="mean",
+                            )
+                        else:
+                            vocab_loss_j = torch.tensor(0.0, device=device)
+
+                        total_loss = total_loss + pointer_loss_j + vocab_loss_j
+
+            # --- Teacher forcing for next input ---
+            if teacher_forcing and tgt_ids is not None and j + 1 < tgt_ids.size(1):
+                decoder_input = tgt_ids[:, j + 1]
+            else:
+                decoder_input = next_ids
+
+        # Convert all_predict_words to tensor format expected by training script
+        pred_tensor = torch.zeros(B, max_decoder_len, dtype=torch.long, device=device)
+        for j in range(max_decoder_len):
+            if j < len(all_predict_words):
                 for b in range(B):
-                    if tgt_j[b].item() == self.pad_idx:
-                        # ignore pad targets (we'll set ignore index)
-                        labels_pos[b] = -100
-                        continue
-                    # find first match in src_ids[b]
-                    matches = (src_ids[b] == tgt_j[b]).nonzero(as_tuple=False)
-                    if matches.numel() > 0:
-                        labels_pos[b] = matches[0, 0].item()
-                    else:
-                        labels_pos[b] = n  # sentinel index
-
-                # pointer loss (cross-entropy over n+1 classes)
-                # pointer_logits: (B, n+1)
-                valid_mask = labels_pos != -100
-                if valid_mask.any():
-                    pointer_loss_j = F.cross_entropy(
-                        pointer_logits[valid_mask],
-                        labels_pos[valid_mask],
-                        reduction="sum",
-                    )
-                else:
-                    pointer_loss_j = torch.tensor(0.0, device=device)
-                loss_pointer = loss_pointer + pointer_loss_j
-
-                # Generation loss: only for samples where label == sentinel (i.e., need to generate)
-                generate_mask = labels_pos == n  # boolean (B,)
-                if generate_mask.any():
-                    # we must compute masked cross-entropy between vocab_logits and gold tgt_j for these samples,
-                    # where allowed positions are confusionset_mask[b, j, :] (for timestep j)
-                    # Build logits and mask for only the generating samples
-                    gen_logits = vocab_logits[generate_mask]  # (G, V)
-                    # corresponding masks:
-                    gen_mask = confusionset_mask[generate_mask, j, :]  # (G, V)
-                    # If for some sample the target is not in mask (shouldn't happen if confusionset covers true char),
-                    # we still allow full vocab as fallback. We'll check and adjust:
-                    tgt_gen = tgt_j[generate_mask]  # (G,)
-                    # Check if target is in mask; if not, expand mask to include target
-                    # (rare but safe)
-                    for idx in range(gen_mask.size(0)):
-                        if gen_mask[idx, tgt_gen[idx]] == 0:
-                            gen_mask[idx, tgt_gen[idx]] = 1
-                    # compute masked probabilities with masked_softmax on logits
-                    # For loss use cross-entropy: we compute logits masked by -inf at disallowed positions and then CE
-                    neg_inf = -1e9
-                    masked_logits = gen_logits.masked_fill(
-                        gen_mask == 0, neg_inf
-                    )  # (G, V)
-                    # if some row has all zeros mask (shouldn't), fallback to unmasked logits
-                    # compute CE
-                    gen_loss_j = F.cross_entropy(
-                        masked_logits, tgt_gen, reduction="sum"
-                    )
-                else:
-                    gen_loss_j = torch.tensor(0.0, device=device)
-                loss_gen = loss_gen + gen_loss_j
-
-            # --- Greedy prediction for next step (and for inference) ---
-            # pointer decision: if argmax pointer_logits != sentinel -> copy; else generate from masked vocab (apply mask then argmax)
-            with torch.no_grad():
-                ptr_choice = pointer_logits.argmax(dim=-1)  # (B,)
-                next_ids = torch.full(
-                    (B,), self.pad_idx, dtype=torch.long, device=device
-                )
-                # copy where ptr_choice < n
-                copy_mask = ptr_choice < n
-                if copy_mask.any():
-                    idxs = copy_mask.nonzero(as_tuple=False).squeeze(-1)
-                    for b in idxs:
-                        pos = ptr_choice[b].item()
-                        next_ids[b] = src_ids[b, pos].item()
-                # generate where ptr_choice == n (sentinel)
-                gen_mask_bool = ptr_choice == n
-                if gen_mask_bool.any():
-                    gen_idxs = gen_mask_bool.nonzero(as_tuple=False).squeeze(-1)
-                    # compute masked probs and pick argmax
-                    gen_logits_all = vocab_logits[gen_idxs]  # (G, V)
-                    masks = confusionset_mask[gen_idxs, j, :]  # (G, V)
-                    # fallback if mask sums to zero -> allow full vocab
-                    sums = masks.sum(dim=-1)
-                    for t_i in range(masks.size(0)):
-                        if sums[t_i] == 0:
-                            masks[t_i] = 1
-                    masked_probs = masked_softmax(gen_logits_all, masks, dim=-1)
-                    chosen = masked_probs.argmax(dim=-1)
-                    for k_i, b in enumerate(gen_idxs):
-                        next_ids[b] = chosen[k_i].item()
-
-            # append predicted id
-            results_pred.append(next_ids.unsqueeze(1))
-            prev_input_ids = next_ids  # feed as prev input in next timestep
-
-        # stack results
-        pred_tensor = torch.cat(results_pred, dim=1)  # (B, n)
-        pointer_logits_tensor = torch.cat(pointer_logits_all, dim=1)  # (B, n, n+1)
-        vocab_logits_tensor = torch.cat(vocab_logits_all, dim=1)  # (B, n, V)
+                    try:
+                        pred_tensor[b, j] = int(all_predict_words[j][b])
+                    except (ValueError, IndexError):
+                        pred_tensor[b, j] = PAD_ID
 
         outputs = {
             "pred_ids": pred_tensor,
-            "pointer_logits": pointer_logits_tensor,
-            "vocab_logits": vocab_logits_tensor,
+            "pointer_logits": all_pointer_logits,
+            "vocab_logits": all_vocab_logits,
         }
 
         if tgt_ids is not None:
-            # total loss normalized by batch size (or by number of tokens) - follow your preference
-            total_loss = (loss_pointer + loss_gen) / src_ids.size(0)
             outputs["loss"] = total_loss
-            outputs["loss_pointer_sum"] = loss_pointer.detach()
-            outputs["loss_gen_sum"] = loss_gen.detach()
 
         return outputs
 
@@ -470,8 +462,10 @@ if __name__ == "__main__":
         dec_hidden=256,
         attn_dim=128,
     )
-    
-    model.load_pretrained_embeddings("data/training/corpus/embeddings/cbow_decay/checkpoints/iter_epoch_100.pt")
+
+    model.load_pretrained_embeddings(
+        "data/training/corpus/embeddings/cbow_decay/checkpoints/iter_epoch_100.pt"
+    )
 
     outputs = model(src_ids, src_mask, conf_mask, tgt_ids=tgt_ids, teacher_forcing=True)
     print("Loss:", outputs["loss"].item())
