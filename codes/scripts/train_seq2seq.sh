@@ -7,7 +7,7 @@ uv run -m codes.methods.train_seq2seq \
     --batch_size 64 \
     --lr 0.001 \
     --num_workers 12 \
-    --scale 10 \
+    --scale 2.5 \
     --phonetic "PhoBERTEncoder" \
     --transform "PMAMWithBERT" \
     --bypass_check \

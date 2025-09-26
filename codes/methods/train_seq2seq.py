@@ -180,6 +180,7 @@ if __name__ == "__main__":
         embed_dim=embed_dim,
         hidden_size=hidden_size,
         att_dim=att_dim,
+        drop_rate=0.3,
         transform=eval(transform_blk)(
             hidden_size=hidden_size,
             gate_hid=gate_hid,
@@ -193,8 +194,8 @@ if __name__ == "__main__":
     if args.embeddings:
         model.load_pretrained_embeddings(args.embeddings)
 
-    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=0.05)
-    l2_lambda = 1e-5
+    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=1e-5)
+    # l2_lambda = 1e-5
     decoding_loss_fn = DecodingLoss(PAD_ID, scale_factor=1.0)
     mcg_loss_fn = MCGLoss(PAD_ID, scale_factor=args.scale)
 
@@ -234,11 +235,11 @@ if __name__ == "__main__":
             optimizer.zero_grad()
 
             logits, l = model(pad_x, viet_texts, pad_y_shift, mask)
-            l2_norm = sum(p.pow(2.0).sum() for p in model.parameters())
+            # l2_norm = sum(p.pow(2.0).sum() for p in model.parameters())
             loss = decoding_loss_fn(logits, pad_y, l, pad_b, mask)
             if l is not None:
                 loss += mcg_loss_fn(logits, pad_y, l, pad_b, mask)
-            loss = loss + l2_lambda * l2_norm
+            # loss = loss + l2_lambda * l2_norm
             loss.backward()
             optimizer.step()
 

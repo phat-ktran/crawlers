@@ -56,6 +56,7 @@ class ConfusionPointerNet(nn.Module):
         self.vocab_size = vocab_size
         self.emb_dim = embed_dim
         self.embed = nn.Embedding(vocab_size, embed_dim, padding_idx=PAD_ID)
+        self.dropout_e = nn.Dropout(drop_rate)
 
         # Encoder: BiLSTM
         self.enc_hidden = enc_hidden
@@ -79,6 +80,7 @@ class ConfusionPointerNet(nn.Module):
 
         # Combine decoder hidden + context -> Cj
         self.combine = nn.Linear(dec_hidden + 2 * enc_hidden, dec_hidden)
+        self.dropout_c = nn.Dropout(drop_rate)
 
         # vocab projection (from combined context)
         self.vocab_proj = nn.Linear(dec_hidden, vocab_size)
@@ -90,6 +92,7 @@ class ConfusionPointerNet(nn.Module):
 
         # Loc embedding isn't necessary as Loc is one-hot; instead we will concat one-hot Loc and Cj and project
         self.pointer_proj = nn.Linear(dec_hidden + 1, ptr_dim)
+        self.dropout_p = nn.Dropout(drop_rate)
         self.pointer_score = nn.Linear(ptr_dim, 1)
 
         # optional dropout
@@ -147,6 +150,7 @@ class ConfusionPointerNet(nn.Module):
             enc_final: (h, c) if needed
         """
         emb = self.embed(src_ids)  # (B, n, E)
+        emb = self.dropout_e(emb)
         packed_out, (h_n, c_n) = self.encoder(emb)  # packed_out: (B, n, 2*enc_hidden)
         # encoder is batch_first=True so packed_out is actually the outputs
         enc_hs = packed_out  # (B, n, 2*enc_hidden)
@@ -174,6 +178,7 @@ class ConfusionPointerNet(nn.Module):
         alpha = F.softmax(score, dim=-1)  # (B, n)
         # compute context
         context = torch.bmm(alpha.unsqueeze(1), enc_hs).squeeze(1)  # (B, 2*enc_hidden)
+        context = self.dropout_c(context)
         return context, alpha
 
     def forward(
@@ -255,6 +260,7 @@ class ConfusionPointerNet(nn.Module):
                 [Cj_exp, Locj_unsq], dim=-1
             )  # (B, n, dec_hidden+1)
             pointer_hidden = torch.tanh(self.pointer_proj(pointer_input))  # (B, n, 128)
+            pointer_hidden = self.dropout_p(pointer_hidden)
             pos_scores = self.pointer_score(pointer_hidden).squeeze(
                 -1
             )  # (B, n) scores for each input position

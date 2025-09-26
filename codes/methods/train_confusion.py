@@ -10,13 +10,24 @@ import csv
 
 from codes.methods.networks.confusionset_pointer_net import ConfusionPointerNet
 from codes.methods.utils import (
-    token2str,
     SOS_ID,
     PAD_ID,
     EOS_ID,
     UNK_ID,
 )
 
+def token2str(ids, mask, id2token, training=False):
+    """
+    Convert list of IDs to string, ignoring special tokens and truncating at EOS.
+    The mask and training parameters are retained for compatibility but unused.
+    """
+    filtered_ids = []
+    for i in ids:
+        if i == EOS_ID:
+            break
+        if i not in {SOS_ID, PAD_ID, UNK_ID}:
+            filtered_ids.append(i)
+    return ''.join(id2token.get(i, '<unk>') for i in filtered_ids)
 
 def build_confusion_mask(
     batch_src_ids: torch.Tensor,
@@ -64,10 +75,10 @@ class CorrectionDataset(Dataset):
         self.samples = []
         for error_seq, gt_seq, viet_seq in data:
             src_ids = [stoi.get(c, UNK_ID) for c in error_seq]
-            tgt_ids = [stoi.get(c, UNK_ID) for c in gt_seq]
+            gt_ids = [stoi.get(c, UNK_ID) for c in gt_seq]
 
             # add <SOS> and <EOS> for the target
-            tgt_ids = [SOS_ID] + tgt_ids + [EOS_ID]
+            tgt_ids = [SOS_ID] + gt_ids + [EOS_ID]
 
             self.samples.append((src_ids, tgt_ids, viet_seq))
 
@@ -106,6 +117,7 @@ def collate_fn(batch, V, conf_map):
 
     # Source mask
     src_mask = (padded_src != PAD_ID).long()
+    
 
     # Confusion mask (use viet seqs)
     conf_mask = build_confusion_mask(padded_src, viet_seqs, V, conf_map)
@@ -256,7 +268,7 @@ def main():
     if args.pretrained_embs:
         model.load_pretrained_embeddings(args.pretrained_embs)
     
-    optimizer = optim.Adam(model.parameters(), lr=args.lr)
+    optimizer = optim.Adam(model.parameters(), lr=args.lr, weight_decay=1e-5)
     logging.info(f"Using device: {device}")
 
     # Training loop
@@ -266,7 +278,7 @@ def main():
         model.train()
         train_loss = 0.0
         for step, batch in enumerate(train_loader, 1):
-            src, src_mask, conf_mask, tgt = [x.to(device) for x in batch[:4]]
+            src, src_mask, conf_mask, tgt, y = [x.to(device) for x in batch[:5]]
             optimizer.zero_grad()
             outputs = model(src, src_mask, conf_mask, tgt_ids=tgt, teacher_forcing=True)
             loss = outputs["loss"]
@@ -279,11 +291,28 @@ def main():
                 pred_ids = outputs["pred_ids"]  # (B, seq_len)
                 B = pred_ids.size(0)
                 for b in range(B):
-                    pred_list = pred_ids[b][pred_ids[b] != PAD_ID].tolist()
-                    tgt_list = tgt[b][tgt[b] != PAD_ID].tolist()
-                    dist = levenshtein_distance(pred_list, tgt_list)
-                    cer = dist / len(tgt_list) if len(tgt_list) > 0 else 0.0
+                    pred_list_full = pred_ids[b][pred_ids[b] != PAD_ID].tolist()
+                    y_list_full = y[b][y[b] != PAD_ID].tolist()
+                    
+                    # Truncate at first EOS if present
+                    try:
+                        eos_idx_pred = pred_list_full.index(EOS_ID)
+                        pred_list = pred_list_full[:eos_idx_pred]
+                    except ValueError:
+                        pred_list = pred_list_full  # No EOS, use all
+                    
+                    try:
+                        eos_idx_y = y_list_full.index(EOS_ID)
+                        gt_list = y_list_full[:eos_idx_y]
+                    except ValueError:
+                        gt_list = y_list_full
+                    
+                    dist = levenshtein_distance(pred_list, gt_list)
+                    cer = dist / len(gt_list) if len(gt_list) > 0 else 0.0
                     cer_list.append(cer)
+                
+                if f:
+                    f.close()
                 avg_cer = sum(cer_list) / len(cer_list) if cer_list else 0.0
 
                 logging.info(f"Epoch {epoch + 1}, Step {step}: Loss = {loss.item()}, CER = {avg_cer:0.4f}")
@@ -300,24 +329,38 @@ def main():
                 
             cer_list = []
             for batch in val_loader:
-                src, src_mask, conf_mask, tgt = [x.to(device) for x in batch]
+                src, src_mask, conf_mask, tgt, y = [x.to(device) for x in batch[:5]]
                 outputs = model(
                     src, src_mask, conf_mask, tgt_ids=tgt, teacher_forcing=False
                 )
                 pred_ids = outputs["pred_ids"]  # (B, seq_len)
                 B = pred_ids.size(0)
+                y_cpu = y.to("cpu")
                 for b in range(B):
-                    pred_list = pred_ids[b][pred_ids[b] != PAD_ID].tolist()
-                    tgt_list = tgt[b][tgt[b] != PAD_ID].tolist()
-                    dist = levenshtein_distance(pred_list, tgt_list)
+                    pred_list_full = pred_ids[b][pred_ids[b] != PAD_ID].tolist()
+                    y_list_full = y[b][y[b] != PAD_ID].tolist()
                     
-                    pred = token2str(pred_list, src_mask[b], id2token, training=True)[:-1]
-                    truth = token2str(tgt_list, src_mask[b], id2token, training=True)
+                    # Truncate at first EOS if present
+                    try:
+                        eos_idx_pred = pred_list_full.index(EOS_ID)
+                        pred_list = pred_list_full[:eos_idx_pred]
+                    except ValueError:
+                        pred_list = pred_list_full  # No EOS, use all
+                    
+                    try:
+                        eos_idx_y = y_list_full.index(EOS_ID)
+                        gt_list = y_list_full[:eos_idx_y]
+                    except ValueError:
+                        gt_list = y_list_full
+                    
+                    dist = levenshtein_distance(pred_list, gt_list)                    
+                    pred = token2str(pred_list, None, id2token, training=False)
+                    truth = token2str(gt_list, None, id2token, training=False)
                     
                     if f is not None:
                         f.write(f"Prediction: {pred}\tGround Truth: {truth}\n")
                     
-                    cer = dist / len(tgt_list) if len(tgt_list) > 0 else 0.0
+                    cer = dist / len(gt_list) if len(gt_list) > 0 else 0.0
                     cer_list.append(cer)
             if f is not None:
                 f.close()
