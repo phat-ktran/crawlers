@@ -72,20 +72,22 @@ class Seq2Seq(nn.Module):
         embed_dim=300,
         hidden_size=256,
         att_dim=256,
+        drop_rate=0.5,
     ):
         super().__init__()
         self.hidden_size = hidden_size
         self.vocab_size = vocab_size
         self.emb_dim = embed_dim
         self.embedding = nn.Embedding(vocab_size, embed_dim, padding_idx=PAD_ID)
+        self.dropout_e = nn.Dropout(p=drop_rate)
         self.sino_encoder = nn.LSTM(
             embed_dim, hidden_size, 1, bidirectional=True, batch_first=True
         )
         self.transform = transform
         self.U = nn.Linear(hidden_size, att_dim)
         self.v = nn.Linear(att_dim, 1)
-        self.dropout_u = nn.Dropout(p=0.5)
-        self.dropout_v = nn.Dropout(p=0.5)
+        self.dropout_u = nn.Dropout(p=drop_rate)
+        self.dropout_v = nn.Dropout(p=drop_rate)
         self.decoder_lstm = nn.LSTMCell(embed_dim, hidden_size)
         self.output_linear = nn.Linear(
             self.transform.hidden_size + hidden_size,
@@ -126,6 +128,7 @@ class Seq2Seq(nn.Module):
         device = x.device
 
         embed_x = self.embedding(x)  # shape: (batch_size, seq_len, embed_dim)
+        embed_x = self.dropout_e(embed_x)
         e, _ = self.sino_encoder(
             embed_x
         )  # e shape: (batch_size, seq_len, 2 * hidden_size)

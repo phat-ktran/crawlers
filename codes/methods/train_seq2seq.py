@@ -114,7 +114,7 @@ if __name__ == "__main__":
         "--transform", type=str, choices=["Standard", "PMAMWithBERT"], default="Standard"
     )
     parser.add_argument(
-        "--phonetic", type=str, choices=["PhoBERTEncoder", "BARTphoEncoder"], default="PhoBERTEncoder"
+        "--phonetic", type=str, choices=["PhoBERTEncoder", "BARTphoEncoder", "None"], default="None"
     )
     parser.add_argument(
         "--dry_run",
@@ -193,7 +193,8 @@ if __name__ == "__main__":
     if args.embeddings:
         model.load_pretrained_embeddings(args.embeddings)
 
-    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
+    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=0.05)
+    l2_lambda = 1e-5
     decoding_loss_fn = DecodingLoss(PAD_ID, scale_factor=1.0)
     mcg_loss_fn = MCGLoss(PAD_ID, scale_factor=args.scale)
 
@@ -210,7 +211,7 @@ if __name__ == "__main__":
             model, train_dl, val_dl, device, id_to_token, decoding_loss_fn, mcg_loss_fn
         )
         exit(0)
-        
+
     logging.info(
         f"Loaded {len(train_ds)} training samples and {len(val_ds)} validation samples."
     )
@@ -233,9 +234,11 @@ if __name__ == "__main__":
             optimizer.zero_grad()
 
             logits, l = model(pad_x, viet_texts, pad_y_shift, mask)
+            l2_norm = sum(p.pow(2.0).sum() for p in model.parameters())
             loss = decoding_loss_fn(logits, pad_y, l, pad_b, mask)
             if l is not None:
                 loss += mcg_loss_fn(logits, pad_y, l, pad_b, mask)
+            loss = loss + l2_lambda * l2_norm
             loss.backward()
             optimizer.step()
 
@@ -258,7 +261,7 @@ if __name__ == "__main__":
             if args.save_res_path is not None:
                 f = open(args.save_res_path, "a")
                 f.write(f"\n======EPOCH {epoch+1}/{args.epochs}======\n")
-                
+
             for pad_x, pad_y_shift, pad_y, pad_b, viet_texts, mask in val_dl:
                 pad_x = pad_x.to(device)
                 pad_y_shift = pad_y_shift.to(device)
@@ -268,17 +271,17 @@ if __name__ == "__main__":
                 logits, l = model(pad_x, viet_texts, pad_y_shift, mask)
                 pad_y_shift = pad_y_shift.to("cpu")
                 predictions, gt = greedy_decoding(logits, mask, id_to_token), pad_y_shift_to_string(pad_y_shift, mask, id_to_token),
-                
+
                 if f is not None:
                     for pred, truth in zip(predictions, gt):
                         f.write(f"Prediction: {pred}\tGround Truth: {truth}\n")
-                
+
                 cer = compute_avg_cer(predictions, gt) * len(viet_texts)
                 val_cer += cer
-            
+
             if f is not None:
                 f.close()
-            
+
         avg_val_cer = val_cer / len(val_ds)
         logging.info(
             f"Epoch {epoch} Summary:\n"
