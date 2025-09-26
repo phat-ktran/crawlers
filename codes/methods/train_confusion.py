@@ -400,9 +400,10 @@ def main():
 
             cer_list = []
             for batch in val_loader:
-                src, src_mask, conf_mask, tgt = [x.to(device) for x in batch[:4]]
+                src, src_mask, conf_mask, tgt, pad_b = [x.to(device) for x in batch[:5]]
+                viet_texts = batch[-1]
                 outputs = model(
-                    src, src_mask, conf_mask, tgt_ids=None, teacher_forcing=False
+                    src, src_mask, conf_mask, viet_texts, tgt_ids=None, teacher_forcing=False
                 )
                 pred_ids = outputs["pred_ids"]  # (B, seq_len)
                 B = pred_ids.size(0)
