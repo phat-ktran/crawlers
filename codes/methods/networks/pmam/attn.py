@@ -64,7 +64,16 @@ class CrossAttention(nn.Module):
         # Handle query padding: Create an additive mask to ignore padded queries
         if sino_mask is not None:
             batch_size, query_len, key_len = sino_states.size(0), sino_states.size(1), viet_hidden.size(1)
-            attn_mask = (sino_mask == 0).unsqueeze(-1).expand(-1, query_len, key_len)  # bool mask
+            attn_mask = torch.zeros(batch_size, query_len, key_len, device=sino_states.device)
+            
+            # Fill masked queries with -1e9 (not -inf)
+            attn_mask = attn_mask.masked_fill((sino_mask == 0).unsqueeze(-1), -1e9)
+    
+            # Guard: if a whole row is masked, replace it with tiny bias (1e-9)
+            row_all_masked = (sino_mask == 0).all(dim=1)
+            if row_all_masked.any():
+                attn_mask[row_all_masked] = 1e-9
+    
             # Expand to (batch_size * num_heads, query_len, key_len)
             attn_mask = attn_mask.unsqueeze(1).expand(-1, self.attn.num_heads, -1, -1).reshape(
                 batch_size * self.attn.num_heads, query_len, key_len

@@ -11,4 +11,5 @@ uv run -m codes.methods.train_seq2seq \
     --phonetic "PhoBERTEncoder" \
     --transform "PMAMWithBERT" \
     --bypass_check \
+    --dry_run \
     --save_res_path data/postprocess/models/seq2seq_v2/results.txt
