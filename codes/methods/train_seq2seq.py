@@ -227,8 +227,8 @@ if __name__ == "__main__":
 
     print_batch_step = args.print_batch_step
     total_steps_per_epoch = len(train_dl)
+    best_val_cer = float("inf")
     logging.info(f"Total steps per epoch: {total_steps_per_epoch}")
-
     for epoch in range(start_epoch, args.epochs):
         model.train()
         current_steps = 0
@@ -292,6 +292,15 @@ if __name__ == "__main__":
 
         avg_val_cer = val_cer / len(val_ds)
         scheduler.step(avg_val_cer)
+        
+        if best_val_cer > avg_val_cer:
+            best_val_cer = avg_val_cer
+            best_checkpoint_path = os.path.join(
+                args.output_dir, f"best_model.pt"
+            )
+            torch.save(model.state_dict(), best_checkpoint_path)
+            logging.info(f"Saved checkpoint to {best_checkpoint_path}")
+        
         logging.info(
             f"Epoch {epoch} Summary:\n"
             f"  Validation CER: {avg_val_cer:.4f}\n"
@@ -300,7 +309,7 @@ if __name__ == "__main__":
         )
 
         ckpt_path = os.path.join(
-            args.output_dir, f"iter_epoch_{epoch}.pt"
+            args.output_dir, f"latest.pt"
         )
         torch.save(
             {

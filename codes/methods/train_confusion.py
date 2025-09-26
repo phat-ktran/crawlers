@@ -299,6 +299,9 @@ def main():
     # Training loop
     total_steps = len(train_loader)
     logging.info(f"Total steps per epoch: {total_steps}")
+    
+    best_val_cer = float("inf")
+    
     for epoch in range(args.epochs):
         model.train()
         train_loss = 0.0
@@ -392,14 +395,22 @@ def main():
             avg_cer = sum(cer_list) / len(cer_list) if cer_list else 0.0
         logging.info(f"Epoch {epoch + 1}/{args.epochs}: CER = {avg_cer}")
         scheduler.step(avg_cer)
+        
+        if avg_cer < best_val_cer:
+            best_val_cer = avg_cer
+            best_checkpoint_path = os.path.join(
+                args.output_dir, f"best_model.pt"
+            )
+            torch.save(model.state_dict(), best_checkpoint_path)
+            logging.info(f"Saved checkpoint to {best_checkpoint_path}")
 
         # Save checkpoint
         os.makedirs(os.path.join(args.output_dir, "checkpoints"), exist_ok=True)
         checkpoint_path = os.path.join(
-            args.output_dir, "checkpoints", f"iter_epoch_{epoch + 1}.pt"
+            args.output_dir, f"latest.pt"
         )
         torch.save(model.state_dict(), checkpoint_path)
-        logging.info(f"Saved checkpoint to {checkpoint_path}")
+        logging.info(f"Saved latest checkpoint to {checkpoint_path}")
 
     logging.info("Training completed.")
 
