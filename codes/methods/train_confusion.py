@@ -202,6 +202,12 @@ def main():
         help="Batch size for training and validation.",
     )
     parser.add_argument(
+        "--num-workers",
+        type=int,
+        default=8,
+        help="Workers for training and validation.",
+    )
+    parser.add_argument(
         "--pretrained-embs",
         type=str,
         default=None,
@@ -261,12 +267,14 @@ def main():
     train_loader = DataLoader(
         train_ds,
         batch_size=args.batch_size,
+        num_workers=args.num_workers,
         shuffle=True,
         collate_fn=lambda b: collate_fn(b, V, conf_map),
     )
     val_loader = DataLoader(
         val_ds,
         batch_size=args.batch_size,
+        num_workers=args.num_workers,
         shuffle=False,
         collate_fn=lambda b: collate_fn(b, V, conf_map),
     )
