@@ -132,16 +132,14 @@ class Seq2Seq(nn.Module):
         e, _ = self.sino_encoder(
             embed_x
         )  # e shape: (batch_size, seq_len, 2 * hidden_size)
-        # tilde_h shape: (batch_size, seq_len, att_dim)
-        # raw_enc shape: (batch_size, seq_len, self.transform.hidden_dim)
-        raw_enc, tilde_h, l = self.transform(
-            e, viet_texts, device
-        )  
 
         batch_size, seq_len = x.shape
         if y_shift is not None: # Training mode
             if mask is None:
                 raise ValueError("Mask is required for training mode.")
+            # tilde_h shape: (batch_size, seq_len, att_dim)
+            # raw_enc shape: (batch_size, seq_len, self.transform.hidden_dim)
+            raw_enc, tilde_h, l = self.transform(e, viet_texts, device, mask)  
             # Embeddings
             embed_y = self.embedding(
                 y_shift
@@ -191,7 +189,9 @@ class Seq2Seq(nn.Module):
         else: # Inference mode 
             if mask is None:
                 mask = (x != PAD_ID).float()  # mask shape: (batch_size, seq_len)
-
+            # tilde_h shape: (batch_size, seq_len, att_dim)
+            # raw_enc shape: (batch_size, seq_len, self.transform.hidden_dim)
+            raw_enc, tilde_h, l = self.transform(e, viet_texts, device, mask)  
             dec_h = torch.zeros(batch_size, self.hidden_size, device=device)
             dec_c = torch.zeros(batch_size, self.hidden_size, device=device)
             current_y = torch.full(
