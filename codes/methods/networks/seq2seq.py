@@ -18,6 +18,10 @@ class SinoNomDataset(Dataset):
         for line in lines:
             parts = line.strip().split("\t")
             input, target = parts[0], parts[1]
+            
+            if len(input) > 40 or len(target) > 40:
+                continue
+            
             x = [vocab.get(c, UNK_ID) for c in input.strip()]
             y = [vocab.get(c, UNK_ID) for c in target.strip()]
             b = [1 if ci == ct else 0 for ci, ct in zip(input, target)]
@@ -166,11 +170,6 @@ class QTSeq2Seq(Seq2Seq):
             src_mask = (x != PAD_ID).float()  # (batch_size, seq_len)
 
         src_enc, fused_enc, ref_mask = self.encoder(embed_x, viet_texts, src_mask)
-        
-        # Log the shapes of src_enc and fused_enc
-        print(f"Shape of src_enc: {src_enc.shape}")
-        print(f"Shape of fused_enc: {fused_enc.shape}")
-
         l = self.qts(fused_enc, src_mask, pad_b)
 
         logits = self.decoder(
