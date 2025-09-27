@@ -5,7 +5,6 @@ uv run -m codes.methods.train_seq2seq \
     --emb_dims 256 \
     --hidden_size 384 \
     --epochs 100 \
-    --checkpoints codes/models/seq2seq_enc_add/latest.pt \
     --print_batch_step 10 \
     --batch_size 64 \
     --lr 0.001 \
