@@ -30,25 +30,30 @@ class MCGLoss(nn.Module):
         self.enable_contrastive = enable_contrastive
 
     def forward(self, logits, targets, l, bp, b, mask):
+        # ---- Drop EOS position ----
+        # assume mask is (B, L) with EOS included at the last valid position
+        # EOS is always the last non-pad element → zero it out
+        eos_mask = mask.clone()
+        eos_mask.scatter_(1, eos_mask.sum(dim=1, keepdim=True).long() - 1, 0)
+    
         # ----- Binary Cross Entropy Loss (for main supervision) -----
         mtr_loss = F.binary_cross_entropy_with_logits(
             l, b.float(), reduction="none"
         )
-        mtr_loss = (mtr_loss * mask).sum() / mask.sum()
-
+        mtr_loss = (mtr_loss * eos_mask).sum() / eos_mask.sum()
+    
         if not self.enable_contrastive:
             return self.scale * mtr_loss, {"bce": mtr_loss.item()}
-            
+    
         # ----- Contrastive Loss -----
         p = torch.sigmoid(l)  # (B, L)
-        # L1 distances
-        d_true = (p - b.float()).abs()  # |p - B|
-        d_approx = (p - bp.float()).abs()  # |p - B'|
-        # Margin ranking objective
+        d_true = (p - b.float()).abs()
+        d_approx = (p - bp.float()).abs()
         contrast_loss = (self.margin + d_approx - d_true).clamp(min=0.0)
-        contrast_loss = (contrast_loss * mask).sum() / mask.sum()
-
-        # ----- Combine -----
+        contrast_loss = (contrast_loss * eos_mask).sum() / eos_mask.sum()
+    
         total_loss = self.scale * (mtr_loss + contrast_loss)
-
-        return total_loss, {"bce": mtr_loss.item(), "contrast": contrast_loss.item()}
+        return total_loss, {
+            "bce": mtr_loss.item(),
+            "contrast": contrast_loss.item(),
+        }
