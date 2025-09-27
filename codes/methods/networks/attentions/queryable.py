@@ -35,7 +35,7 @@ class LightWeightQT(QueryableTokens):
         self.q_proj = nn.Linear(d_model, d_model)
 
         # positional encoding
-        self.pe = nn.Parameter(torch.randn(1, max_len, d_model))
+        self.pe = nn.Parameter(torch.randn(1, max_len+1, d_model))
 
         # self-attention among queries
         self.self_attn = nn.MultiheadAttention(
@@ -111,14 +111,14 @@ class ComplexQT(QueryableTokens):
         self.d_model = d_model
 
         # Directly learnable base tokens (instead of q_base)
-        self.query_tokens = nn.Parameter(torch.randn(max_len, d_model))
+        self.query_tokens = nn.Parameter(torch.randn(max_len+1, d_model))
 
         # Prototypes for B′ conditioning
         self.v1 = nn.Parameter(torch.randn(d_model))  # "likely correct"
         self.v0 = nn.Parameter(torch.randn(d_model))  # "likely erroneous"
 
         # Positional encoding
-        self.pos_encoding = nn.Parameter(torch.randn(max_len, d_model))
+        self.pos_encoding = nn.Parameter(torch.randn(max_len+1, d_model))
 
         # Self-attention block (lightweight)
         self.self_attn = nn.MultiheadAttention(
