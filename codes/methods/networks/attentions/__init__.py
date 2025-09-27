@@ -2,6 +2,8 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
+from codes.methods.networks.attentions.queryable import *
+
 class BahdanauAttention(nn.Module):
     def __init__(
         self,

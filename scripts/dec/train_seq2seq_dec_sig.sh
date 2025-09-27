@@ -9,10 +9,10 @@ uv run -m codes.methods.train_seq2seq \
     --batch_size 64 \
     --lr 0.001 \
     --num_workers 8 \
-    --fusion "Add" \
+    --fusion "Sigmoid" \
     --fuser-location "Decoder" \
     --decoder "MultiSourceDecoder" \
-    --encoder "PhoBERTEncoder" \
+    --ref-encoder "PhoBERTEncoder" \
     --bypass_check \
     --save_res_path codes/models/seq2seq_dec_add/results.txt \
     --dry_run

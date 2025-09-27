@@ -4,18 +4,18 @@ import logging
 import torch
 from torch.utils.data import DataLoader
 
-from codes.methods.networks.attentions import BahdanauAttention
 from codes.methods.networks.decoders import Decoder, MultiSourceDecoder
-from codes.methods.networks.encoders import Encoder
-from codes.methods.networks.encoders.bert_enc import PhoBERTEncoder
-from codes.methods.networks.encoders.fuse import Fusion, Add, Concat, Sigmoid, Residual, AdaptiveTemporalPooling
+from codes.methods.networks.attentions import BahdanauAttention
+from codes.methods.networks.encoders import Encoder, PhoBERTEncoder
+from codes.methods.networks.encoders.fuse import AdaptiveTemporalPooling, Add, Concat, Sigmoid, Residual
 from codes.methods.networks.encoders.sinonom_enc import SinoNomEncoder
 from codes.methods.networks.seq2seq import (
     Seq2Seq,
+    QTSeq2Seq,
     SinoNomDataset,
     collate_fn,
 )
-from codes.methods.networks.pmam.losses import DecodingLoss, MCGLoss
+from codes.methods.networks.losses import DecodingLoss, MCGLoss
 from codes.methods.utils import (
     greedy_decoding,
     pad_y_shift_to_string,
@@ -38,11 +38,12 @@ def run_dry_run(
     model.eval()
 
     # Test with one batch from training data
-    for pad_x, pad_y_shift, pad_y, pad_b, viet_texts, mask in train_dl:
+    for pad_x, pad_y_shift, pad_y, pad_bp, pad_b, viet_texts, mask in train_dl:
         pad_x = pad_x.to(device)
         pad_y_shift = pad_y_shift.to(device)
         pad_y = pad_y.to(device)
         pad_b = pad_b.to(device)
+        pad_bp = pad_bp.to(device)
         mask = mask.to(device)
 
         logging.debug(f"Input batch shape: {pad_x.shape}")
@@ -54,7 +55,7 @@ def run_dry_run(
             try:
                 # Test training mode forward pass
                 logging.debug("\nTesting training mode forward pass...")
-                logits, l = model(pad_x, viet_texts, pad_y_shift, mask)
+                logits, l = model(pad_x, viet_texts, pad_bp, pad_y_shift, mask)
                 logging.debug(f"Training mode - Logits shape: {logits.shape}")
                 if l is not None:
                     logging.debug(f"Training mode - Loss component shape: {l.shape}")
@@ -63,22 +64,26 @@ def run_dry_run(
 
                 # Test inference mode forward pass
                 logging.debug("\nTesting inference mode forward pass...")
-                logits_inf, l_inf = model(pad_x, viet_texts, None, mask)
+                logits_inf, l_inf = model(pad_x, viet_texts, pad_bp, None, mask)
                 logging.debug(f"Inference mode - Logits shape: {logits_inf.shape}")
                 if l_inf is not None:
-                    logging.debug(f"Inference mode - Loss component shape: {l_inf.shape}")
+                    logging.debug(
+                        f"Inference mode - Loss component shape: {l_inf.shape}"
+                    )
                 else:
                     logging.debug("Inference mode - No additional loss component")
 
                 # Test loss calculation
                 logging.debug("\nTesting loss calculation...")
-                loss = decoding_loss_fn(logits, pad_y, l, pad_b, mask)
+                loss = decoding_loss_fn(logits, pad_y, l, pad_bp, pad_b, mask)
                 logging.debug(f"Decoding loss: {loss.item():.4f}")
 
                 if l is not None:
-                    mcg_loss = mcg_loss_fn(logits, pad_y, l, pad_b, mask)
+                    mcg_loss, outputs = mcg_loss_fn(logits, pad_y, l, pad_bp, pad_b, mask)
                     total_loss = loss + mcg_loss
                     logging.debug(f"MCG loss: {mcg_loss.item():.4f}")
+                    logging.debug(f"====BCE loss: {outputs["bce"]:.4f}")
+                    logging.debug(f"====Contrastive loss: {outputs["contrast"]:.4f}")
                     logging.debug(f"Total loss: {total_loss.item():.4f}")
 
                 # Test CER computation
@@ -130,6 +135,7 @@ def create_dataloaders(vocab, args):
 
     return train_dl, val_dl, len(val_ds)
 
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--input-dir", required=True)
@@ -146,9 +152,18 @@ if __name__ == "__main__":
     parser.add_argument(
         "--bypass_check", action="store_true", help="Bypass 1-1 mapping check"
     )
-    parser.add_argument("--heads", type=int, default=8, help="Number of attention heads")
-    parser.add_argument("--attn_drop_out", type=float, default=0.3, help="Dropout rate for attention layers")
-    parser.add_argument("--drop_out", type=float, default=0.5, help="Dropout rate for the model")
+    parser.add_argument(
+        "--heads", type=int, default=8, help="Number of attention heads"
+    )
+    parser.add_argument(
+        "--attn_drop_out",
+        type=float,
+        default=0.3,
+        help="Dropout rate for attention layers",
+    )
+    parser.add_argument(
+        "--drop_out", type=float, default=0.5, help="Dropout rate for the model"
+    )
     parser.add_argument("--print_batch_step", type=int, default=10)
     parser.add_argument("--lr", type=float, default=0.001)
     parser.add_argument("--batch_size", type=int, default=32)
@@ -159,8 +174,28 @@ if __name__ == "__main__":
     parser.add_argument(
         "--fusion",
         type=str,
-        choices=["Fusion", "Concat", "Add", "Sigmoid", "Residual", "ATP-Max", "ATP-Avg"],
+        choices=[
+            "Fusion",
+            "Concat",
+            "Add",
+            "Sigmoid",
+            "Residual",
+            "ATP-Max",
+            "ATP-Avg",
+        ],
         default="Fusion",
+    )
+    parser.add_argument(
+        "--arch",
+        type=str,
+        choices=["Seq2Seq", "QTSeq2Seq"],
+        default="Seq2Seq",
+    )
+    parser.add_argument(
+        "--qt-type",
+        type=str,
+        choices=["LightWeightQT", "ComplexQT"],
+        default="LightWeightQT",
     )
     parser.add_argument(
         "--fusion-mode",
@@ -176,7 +211,7 @@ if __name__ == "__main__":
         help="Specify where to place the fuser: in the encoder or decoder",
     )
     parser.add_argument(
-        "--encoder",
+        "--ref-encoder",
         type=str,
         choices=["Identity", "PhoBERTEncoder"],
         default="Identity",
@@ -192,8 +227,12 @@ if __name__ == "__main__":
         action="store_true",
         help="Run a dry run to test the forward pass without training",
     )
+    parser.add_argument(
+        "--contrastive",
+        action="store_true",
+    )
     args = parser.parse_args()
-    
+
     os.makedirs(os.path.join(args.output_dir), exist_ok=True)
     if args.dry_run:
         logging.basicConfig(
@@ -221,13 +260,13 @@ if __name__ == "__main__":
 
     embed_dim = args.emb_dims
     hidden_size = args.hidden_size
-    ref_encoder = eval(args.encoder)()
+    ref_encoder = eval(args.ref_encoder)()
     if args.fusion in ["ATP-Max", "ATP-Avg"]:
         fuser = AdaptiveTemporalPooling(
             src_hidden_size=hidden_size,
             ref_hidden_size=ref_encoder.hidden_size,
             mode=args.fusion_mode,
-            method="max" if args.fusion == "ATP-Max" else "mean"
+            method="max" if args.fusion == "ATP-Max" else "mean",
         )
     else:
         fuser = eval(args.fusion)(
@@ -236,14 +275,22 @@ if __name__ == "__main__":
             num_heads=args.heads,
             drop_out=args.attn_drop_out,
         )
-    
+
     enc_fuser, dec_fuser = None, None
     if args.fuser_location == "Encoder":
         enc_fuser = fuser
     else:
         dec_fuser = fuser
-    
-    model = Seq2Seq(
+
+    enc_hidden_size = 0
+    if enc_fuser:
+        enc_hidden_size = fuser.fused_dim
+    elif dec_fuser:
+        enc_hidden_size = fuser.fused_dim
+    elif args.ref_encoder == "Identity":
+        enc_hidden_size = 2 * hidden_size
+
+    model = eval(args.arch)(
         vocab_size=vocab_size,
         encoder=Encoder(
             src_enc=SinoNomEncoder(
@@ -254,18 +301,21 @@ if __name__ == "__main__":
             fuser=enc_fuser,
         ),
         attention=BahdanauAttention(
-            enc_hidden_size=fuser.fused_dim,
+            enc_hidden_size=enc_hidden_size,
             dec_hidden_size=hidden_size,
             att_dim=hidden_size,
         ),
         decoder=eval(args.decoder)(
             embed_dim=embed_dim,
             hidden_size=hidden_size,
-            context_dim=fuser.fused_dim,
+            context_dim=fuser.fused_dim
+            if args.ref_encoder != "Identity"
+            else 2 * hidden_size,
             vocab_size=vocab_size,
-            fuser=dec_fuser
+            fuser=dec_fuser,
         ),
         drop_rate=args.drop_out,
+        qt_mod=args.qt_type,
     )
     model.to(device)
     model.init_weights()
@@ -284,7 +334,9 @@ if __name__ == "__main__":
     )
 
     decoding_loss_fn = DecodingLoss(PAD_ID, scale_factor=1.0)
-    mcg_loss_fn = MCGLoss(PAD_ID, scale_factor=args.scale)
+    mcg_loss_fn = MCGLoss(
+        PAD_ID, scale_factor=args.scale, enable_contrastive=args.contrastive
+    )
 
     start_epoch = 0
     if args.checkpoints:
@@ -292,7 +344,7 @@ if __name__ == "__main__":
         model.load_state_dict(ckpt["model"])
         optimizer.load_state_dict(ckpt["optimizer"])
         start_epoch = ckpt["epoch"] + 1
-        
+
     if args.eval:
         with torch.no_grad():
             f = None
@@ -300,13 +352,13 @@ if __name__ == "__main__":
                 f = open(args.save_res_path, "a")
                 f.write(f"\n======EPOCH {start_epoch}/{args.epochs}======\n")
             val_cer = 0.0
-            for pad_x, pad_y_shift, pad_y, pad_b, viet_texts, mask in val_dl:
+            for pad_x, pad_y_shift, pad_y, pad_bp, pad_b, viet_texts, mask in val_dl:
                 pad_x = pad_x.to(device)
                 pad_y_shift = pad_y_shift.to(device)
                 pad_y = pad_y.to(device)
-                pad_b = pad_b.to(device)
+                pad_bp = pad_bp.to(device)
                 mask = mask.to(device)
-                logits, l = model(pad_x, viet_texts, None, mask)
+                logits, l = model(pad_x, viet_texts, pad_bp, None, mask)
                 pad_y_shift = pad_y_shift.to("cpu")
                 predictions, gts = (
                     greedy_decoding(logits, mask, id_to_token),
@@ -344,19 +396,21 @@ if __name__ == "__main__":
     for epoch in range(start_epoch, args.epochs):
         model.train()
         current_steps = 0
-        for pad_x, pad_y_shift, pad_y, pad_b, viet_texts, mask in train_dl:
+        for pad_x, pad_y_shift, pad_y, pad_bp, pad_b, viet_texts, mask in train_dl:
             current_steps += 1
             pad_x = pad_x.to(device)
             pad_y_shift = pad_y_shift.to(device)
             pad_y = pad_y.to(device)
+            pad_bp = pad_bp.to(device)
             pad_b = pad_b.to(device)
             mask = mask.to(device)
             optimizer.zero_grad()
 
-            logits, l = model(pad_x, viet_texts, pad_y_shift, mask)
-            loss = decoding_loss_fn(logits, pad_y, l, pad_b, mask)
+            logits, l = model(pad_x, viet_texts, pad_bp, pad_y_shift, mask)
+            loss = decoding_loss_fn(logits, pad_y, l, pad_bp, pad_b, mask)
             if l is not None:
-                loss += mcg_loss_fn(logits, pad_y, l, pad_b, mask)
+                total_loss, outputs = mcg_loss_fn(logits, pad_y, l, pad_bp, pad_b, mask)
+                loss += total_loss
             loss.backward()
             optimizer.step()
 
@@ -384,13 +438,13 @@ if __name__ == "__main__":
                 f = open(args.save_res_path, "a")
                 f.write(f"\n======EPOCH {epoch + 1}/{args.epochs}======\n")
 
-            for pad_x, pad_y_shift, pad_y, pad_b, viet_texts, mask in val_dl:
+            for pad_x, pad_y_shift, pad_y, pad_bp, pad_b, viet_texts, mask in val_dl:
                 pad_x = pad_x.to(device)
                 pad_y_shift = pad_y_shift.to(device)
                 pad_y = pad_y.to(device)
-                pad_b = pad_b.to(device)
+                pad_bp = pad_bp.to(device)
                 mask = mask.to(device)
-                logits, l = model(pad_x, viet_texts, None, mask)
+                logits, l = model(pad_x, viet_texts, pad_bp, None, mask)
                 pad_y_shift = pad_y_shift.to("cpu")
                 predictions, gts = (
                     greedy_decoding(logits, mask, id_to_token),

@@ -1,6 +1,6 @@
 uv run -m codes.methods.train_seq2seq \
     --input-dir data/postprocess/segmented \
-    --output-dir codes/models/seq2seq/ \
+    --output-dir codes/models/seq2seq_enc_res/ \
     --embeddings data/postprocess/embeddings/best.pt \
     --emb_dims 256 \
     --hidden_size 384 \
@@ -9,7 +9,7 @@ uv run -m codes.methods.train_seq2seq \
     --batch_size 64 \
     --lr 0.001 \
     --num_workers 8 \
-    --fusion "Fusion" \
-    --ref-encoder "Identity" \
+    --fusion "Residual" \
+    --ref-encoder "PhoBERTEncoder" \
     --bypass_check \
-    --save_res_path codes/models/seq2seq/results.txt
+    --save_res_path codes/models/seq2seq_enc_res/results.txt

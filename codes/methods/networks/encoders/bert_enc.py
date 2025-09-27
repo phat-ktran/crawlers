@@ -7,6 +7,10 @@ class VietEncoder(nn.Module):
     def init_weights(self):
         pass
         
+    @property
+    def hidden_size(self):
+        return 128
+        
     def forward(self, viet_texts, device):
         raise NotImplementedError("This method should be implemented by subclasses.")
         

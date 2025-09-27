@@ -1,7 +1,10 @@
 uv run -m codes.methods.train_seq2seq \
     --input-dir data/postprocess/segmented \
-    --output-dir codes/models/seq2seq/ \
+    --output-dir codes/models/seq2seq_enc_qt_res/ \
     --embeddings data/postprocess/embeddings/best.pt \
+    --arch "QTSeq2Seq" \
+    --qt-type "LightWeightQT" \
+    --contrastive \
     --emb_dims 256 \
     --hidden_size 384 \
     --epochs 100 \
@@ -9,7 +12,8 @@ uv run -m codes.methods.train_seq2seq \
     --batch_size 64 \
     --lr 0.001 \
     --num_workers 8 \
-    --fusion "Fusion" \
-    --ref-encoder "Identity" \
+    --fusion "Residual" \
+    --ref-encoder "PhoBERTEncoder" \
     --bypass_check \
-    --save_res_path codes/models/seq2seq/results.txt
+    --scale 5.0 \
+    --save_res_path codes/models/seq2seq_enc_qt_res/results.txt

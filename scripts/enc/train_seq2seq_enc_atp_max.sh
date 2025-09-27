@@ -11,7 +11,7 @@ uv run -m codes.methods.train_seq2seq \
     --num_workers 8 \
     --fusion "ATP-Max" \
     --fusion-mode "Add" \
-    --encoder "PhoBERTEncoder" \
+    --ref-encoder "PhoBERTEncoder" \
     --bypass_check \
     --save_res_path codes/models/seq2seq_enc_max/results.txt \
     --dry_run

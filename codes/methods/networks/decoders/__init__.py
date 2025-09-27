@@ -156,4 +156,4 @@ class MultiSourceDecoder(Decoder):
             queries=dec_out, keys=fused_enc, values=fused_enc, mask=ref_mask
         )  # (batch_size, seq_len, context_dim)
 
-        return self.fuser(src_ctx, ref_ctx, src_mask, src_mask)
+        return self.fuser(src_ctx, ref_ctx, src_mask, ref_mask)
