@@ -166,6 +166,10 @@ class QTSeq2Seq(Seq2Seq):
             src_mask = (x != PAD_ID).float()  # (batch_size, seq_len)
 
         src_enc, fused_enc, ref_mask = self.encoder(embed_x, viet_texts, src_mask)
+        
+        # Log the shapes of src_enc and fused_enc
+        print(f"Shape of src_enc: {src_enc.shape}")
+        print(f"Shape of fused_enc: {fused_enc.shape}")
 
         l = self.qts(fused_enc, src_mask, pad_b)
 
