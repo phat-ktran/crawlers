@@ -107,7 +107,7 @@ class Seq2Seq(nn.Module):
         if src_mask is None and y_shift is None:
             src_mask = (x != PAD_ID).float()  # (batch_size, seq_len)
 
-        src_enc, fused_enc = self.encoder(embed_x, viet_texts, src_mask)
+        src_enc, fused_enc, ref_mask = self.encoder(embed_x, viet_texts, src_mask)
 
         logits = self.decoder(
             y_shift,
@@ -116,6 +116,7 @@ class Seq2Seq(nn.Module):
             src_enc,
             fused_enc,
             src_mask,
+            ref_mask,
             device,
             max_len=seq_len if y_shift is None else None,
         )

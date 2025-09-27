@@ -1,16 +1,17 @@
 uv run -m codes.methods.train_seq2seq \
     --input-dir data/postprocess/segmented \
-    --output-dir codes/models/seq2seq_enc_add/ \
+    --output-dir codes/models/seq2seq_enc_max/ \
     --embeddings data/postprocess/embeddings/best.pt \
     --emb_dims 256 \
     --hidden_size 384 \
     --epochs 100 \
-    --checkpoints codes/models/seq2seq_enc_add/latest.pt \
     --print_batch_step 10 \
     --batch_size 64 \
     --lr 0.001 \
     --num_workers 8 \
-    --fusion "Add" \
+    --fusion "ATP-Max" \
+    --fusion-mode "Add" \
     --encoder "PhoBERTEncoder" \
     --bypass_check \
-    --save_res_path codes/models/seq2seq_enc_add/results.txt
+    --save_res_path codes/models/seq2seq_enc_max/results.txt \
+    --dry_run

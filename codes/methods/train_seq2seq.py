@@ -5,10 +5,10 @@ import torch
 from torch.utils.data import DataLoader
 
 from codes.methods.networks.attentions import BahdanauAttention
-from codes.methods.networks.decoders import Decoder
+from codes.methods.networks.decoders import Decoder, MultiSourceDecoder
 from codes.methods.networks.encoders import Encoder
 from codes.methods.networks.encoders.bert_enc import PhoBERTEncoder
-from codes.methods.networks.encoders.fuse import Fusion, Add, Concat, Sigmoid, Residual
+from codes.methods.networks.encoders.fuse import Fusion, Add, Concat, Sigmoid, Residual, AdaptiveTemporalPooling
 from codes.methods.networks.encoders.sinonom_enc import SinoNomEncoder
 from codes.methods.networks.seq2seq import (
     Seq2Seq,
@@ -130,12 +130,11 @@ def create_dataloaders(vocab, args):
 
     return train_dl, val_dl, len(val_ds)
 
-
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--input-dir", required=True)
     parser.add_argument("--output-dir", required=True)
-    parser.add_argument("--checkpoint", default=None)
+    parser.add_argument("--checkpoints", default=None)
     parser.add_argument("--embeddings", type=str, default=None)
     parser.add_argument(
         "--emb_dims", type=int, default=256, help="Embedding dimensions for the model"
@@ -156,17 +155,37 @@ if __name__ == "__main__":
     parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--save_res_path", type=str, default=None)
     parser.add_argument("--scale", type=float, default=0.5)
+    parser.add_argument("--eval", action="store_true")
     parser.add_argument(
         "--fusion",
         type=str,
-        choices=["Fusion", "Concat", "Add", "Sigmoid", "Residual"],
+        choices=["Fusion", "Concat", "Add", "Sigmoid", "Residual", "ATP-Max", "ATP-Avg"],
         default="Fusion",
+    )
+    parser.add_argument(
+        "--fusion-mode",
+        type=str,
+        choices=["Concat", "Add"],
+        default="Add",
+    )
+    parser.add_argument(
+        "--fuser-location",
+        type=str,
+        choices=["Encoder", "Decoder"],
+        default="Encoder",
+        help="Specify where to place the fuser: in the encoder or decoder",
     )
     parser.add_argument(
         "--encoder",
         type=str,
         choices=["Identity", "PhoBERTEncoder"],
         default="Identity",
+    )
+    parser.add_argument(
+        "--decoder",
+        type=str,
+        choices=["Decoder", "MultiSourceDecoder"],
+        default="Decoder",
     )
     parser.add_argument(
         "--dry_run",
@@ -203,12 +222,27 @@ if __name__ == "__main__":
     embed_dim = args.emb_dims
     hidden_size = args.hidden_size
     ref_encoder = eval(args.encoder)()
-    fuser = eval(args.fusion)(
-        src_hidden_size=hidden_size,
-        ref_hidden_size=ref_encoder.hidden_size,
-        num_heads=args.heads,
-        drop_out=args.attn_drop_out,
-    )
+    if args.fusion in ["ATP-Max", "ATP-Avg"]:
+        fuser = AdaptiveTemporalPooling(
+            src_hidden_size=hidden_size,
+            ref_hidden_size=ref_encoder.hidden_size,
+            mode=args.fusion_mode,
+            method="max" if args.fusion == "ATP-Max" else "mean"
+        )
+    else:
+        fuser = eval(args.fusion)(
+            src_hidden_size=hidden_size,
+            ref_hidden_size=ref_encoder.hidden_size,
+            num_heads=args.heads,
+            drop_out=args.attn_drop_out,
+        )
+    
+    enc_fuser, dec_fuser = None, None
+    if args.fuser_location == "Encoder":
+        enc_fuser = fuser
+    else:
+        dec_fuser = fuser
+    
     model = Seq2Seq(
         vocab_size=vocab_size,
         encoder=Encoder(
@@ -217,18 +251,19 @@ if __name__ == "__main__":
                 hidden_size=hidden_size,
             ),
             ref_enc=ref_encoder,
-            fuser=fuser,
+            fuser=enc_fuser,
         ),
         attention=BahdanauAttention(
             enc_hidden_size=fuser.fused_dim,
             dec_hidden_size=hidden_size,
             att_dim=hidden_size,
         ),
-        decoder=Decoder(
+        decoder=eval(args.decoder)(
             embed_dim=embed_dim,
             hidden_size=hidden_size,
             context_dim=fuser.fused_dim,
             vocab_size=vocab_size,
+            fuser=dec_fuser
         ),
         drop_rate=args.drop_out,
     )
@@ -252,11 +287,48 @@ if __name__ == "__main__":
     mcg_loss_fn = MCGLoss(PAD_ID, scale_factor=args.scale)
 
     start_epoch = 0
-    if args.checkpoint:
-        ckpt = torch.load(args.checkpoint)
+    if args.checkpoints:
+        ckpt = torch.load(args.checkpoints)
         model.load_state_dict(ckpt["model"])
         optimizer.load_state_dict(ckpt["optimizer"])
         start_epoch = ckpt["epoch"] + 1
+        
+    if args.eval:
+        with torch.no_grad():
+            f = None
+            if args.save_res_path is not None:
+                f = open(args.save_res_path, "a")
+                f.write(f"\n======EPOCH {start_epoch}/{args.epochs}======\n")
+            val_cer = 0.0
+            for pad_x, pad_y_shift, pad_y, pad_b, viet_texts, mask in val_dl:
+                pad_x = pad_x.to(device)
+                pad_y_shift = pad_y_shift.to(device)
+                pad_y = pad_y.to(device)
+                pad_b = pad_b.to(device)
+                mask = mask.to(device)
+                logits, l = model(pad_x, viet_texts, None, mask)
+                pad_y_shift = pad_y_shift.to("cpu")
+                predictions, gts = (
+                    greedy_decoding(logits, mask, id_to_token),
+                    pad_y_shift_to_string(pad_y_shift, mask, id_to_token),
+                )
+
+                predictions = [pred.replace("<unk>", "") for pred in predictions]
+                gts = [gt.replace("<unk>", "") for gt in gts]
+
+                if f is not None:
+                    for pred, truth in zip(predictions, gts):
+                        f.write(f"Prediction: {pred}\tGround Truth: {truth}\n")
+
+                cer = compute_avg_cer(predictions, gts) * len(viet_texts)
+                val_cer += cer
+
+            if f is not None:
+                f.close()
+
+        avg_val_cer = val_cer / val_size
+        print(avg_val_cer)
+        exit(0)
 
     # If dry_run flag is set, run the dry run and exit
     if args.dry_run:
@@ -318,7 +390,7 @@ if __name__ == "__main__":
                 pad_y = pad_y.to(device)
                 pad_b = pad_b.to(device)
                 mask = mask.to(device)
-                logits, l = model(pad_x, viet_texts, pad_y_shift, mask)
+                logits, l = model(pad_x, viet_texts, None, mask)
                 pad_y_shift = pad_y_shift.to("cpu")
                 predictions, gts = (
                     greedy_decoding(logits, mask, id_to_token),
@@ -343,9 +415,9 @@ if __name__ == "__main__":
 
         if best_val_cer > avg_val_cer:
             best_val_cer = avg_val_cer
-            best_checkpoint_path = os.path.join(args.output_dir, "best_model.pt")
-            torch.save(model.state_dict(), best_checkpoint_path)
-            logging.info(f"Saved checkpoint to {best_checkpoint_path}")
+            best_checkpoints_path = os.path.join(args.output_dir, "best_model.pt")
+            torch.save(model.state_dict(), best_checkpoints_path)
+            logging.info(f"Saved checkpoints to {best_checkpoints_path}")
 
         logging.info(
             f"Epoch {epoch} Summary:\n"
