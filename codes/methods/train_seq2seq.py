@@ -6,8 +6,8 @@ from torch.utils.data import DataLoader
 
 from codes.methods.networks.decoders import Decoder, MultiSourceDecoder
 from codes.methods.networks.attentions import BahdanauAttention
-from codes.methods.networks.encoders import Encoder, PhoBERTEncoder
-from codes.methods.networks.encoders.fuse import AdaptiveTemporalPooling, Add, Concat, Sigmoid, Residual
+from codes.methods.networks.encoders import Encoder, PhoBERTEncoder, Identity
+from codes.methods.networks.encoders.fuse import AdaptiveTemporalPooling, Add, Concat, Sigmoid, Residual, Fusion
 from codes.methods.networks.encoders.sinonom_enc import SinoNomEncoder
 from codes.methods.networks.seq2seq import (
     Seq2Seq,
@@ -308,9 +308,7 @@ if __name__ == "__main__":
         decoder=eval(args.decoder)(
             embed_dim=embed_dim,
             hidden_size=hidden_size,
-            context_dim=fuser.fused_dim
-            if args.ref_encoder != "Identity"
-            else 2 * hidden_size,
+            context_dim=fuser.fused_dim,
             vocab_size=vocab_size,
             fuser=dec_fuser,
         ),

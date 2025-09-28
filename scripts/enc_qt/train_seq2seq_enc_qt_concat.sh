@@ -15,5 +15,5 @@ uv run -m codes.methods.train_seq2seq \
     --fusion "Concat" \
     --ref-encoder "PhoBERTEncoder" \
     --bypass_check \
-    --scale 5.0 \
+    --scale 0.5 \
     --save_res_path codes/models/seq2seq_enc_qt_concat/results.txt

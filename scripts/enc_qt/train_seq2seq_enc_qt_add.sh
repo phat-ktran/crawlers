@@ -16,4 +16,4 @@ uv run -m codes.methods.train_seq2seq \
     --ref-encoder "PhoBERTEncoder" \
     --bypass_check \
     --save_res_path codes/models/seq2seq_enc_qt_add/results.txt \
-    --scale 5.0
+    --scale 0.5

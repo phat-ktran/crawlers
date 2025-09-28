@@ -8,7 +8,7 @@ logger = logging.getLogger(__name__)
 class Fusion(nn.Module):
     def __init__(self, src_hidden_size: int, ref_hidden_size: int, **kwargs) -> None:
         super().__init__()
-        self.fused_dim = src_hidden_size
+        self.fused_dim = 2 * src_hidden_size
 
     def forward(
         self,

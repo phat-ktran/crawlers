@@ -2,7 +2,7 @@ from typing import Optional
 from torch import nn
 from codes.methods.networks.encoders.fuse import Fusion
 from codes.methods.networks.encoders.sinonom_enc import SinoNomEncoder
-from codes.methods.networks.encoders.bert_enc import PhoBERTEncoder, VietEncoder
+from codes.methods.networks.encoders.bert_enc import PhoBERTEncoder, VietEncoder, Identity
 
 class Encoder(nn.Module):
     def __init__(self, src_enc: SinoNomEncoder, ref_enc: VietEncoder, fuser: Optional[Fusion]):
